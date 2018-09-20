@@ -146,21 +146,21 @@ static int do_psnr(FFFrameSync *fs)
 {
     AVFilterContext *ctx = fs->parent;
     PSNRContext *s = ctx->priv;
-    AVFrame *main, *ref;
+    AVFrame *master, *ref;
     double comp_mse[4], mse = 0;
     int ret, j, c;
     AVDictionary **metadata;
 
-    ret = ff_framesync_dualinput_get(fs, &main, &ref);
+    ret = ff_framesync_dualinput_get(fs, &master, &ref);
     if (ret < 0)
         return ret;
     if (!ref)
-        return ff_filter_frame(ctx->outputs[0], main);
-    metadata = &main->metadata;
+        return ff_filter_frame(ctx->outputs[0], master);
+    metadata = &master->metadata;
 
-    compute_images_mse(s, (const uint8_t **)main->data, main->linesize,
+    compute_images_mse(s, (const uint8_t **)master->data, master->linesize,
                           (const uint8_t **)ref->data, ref->linesize,
-                          main->width, main->height, comp_mse);
+                          master->width, master->height, comp_mse);
 
     for (j = 0; j < s->nb_components; j++)
         mse += comp_mse[j] * s->planeweight[j];
@@ -222,7 +222,7 @@ static int do_psnr(FFFrameSync *fs)
         fprintf(s->stats_file, "\n");
     }
 
-    return ff_filter_frame(ctx->outputs[0], main);
+    return ff_filter_frame(ctx->outputs[0], master);
 }
 
 static av_cold int init(AVFilterContext *ctx)
@@ -260,7 +260,7 @@ static av_cold int init(AVFilterContext *ctx)
 static int query_formats(AVFilterContext *ctx)
 {
     static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY9, AV_PIX_FMT_GRAY10, AV_PIX_FMT_GRAY12, AV_PIX_FMT_GRAY16,
+        AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY9, AV_PIX_FMT_GRAY10, AV_PIX_FMT_GRAY12, AV_PIX_FMT_GRAY14, AV_PIX_FMT_GRAY16,
 #define PF_NOALPHA(suf) AV_PIX_FMT_YUV420##suf,  AV_PIX_FMT_YUV422##suf,  AV_PIX_FMT_YUV444##suf
 #define PF_ALPHA(suf)   AV_PIX_FMT_YUVA420##suf, AV_PIX_FMT_YUVA422##suf, AV_PIX_FMT_YUVA444##suf
 #define PF(suf)         PF_NOALPHA(suf), PF_ALPHA(suf)
@@ -270,7 +270,7 @@ static int query_formats(AVFilterContext *ctx)
         AV_PIX_FMT_YUVJ440P, AV_PIX_FMT_YUVJ444P,
         AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRP9, AV_PIX_FMT_GBRP10,
         AV_PIX_FMT_GBRP12, AV_PIX_FMT_GBRP14, AV_PIX_FMT_GBRP16,
-        AV_PIX_FMT_GBRAP, AV_PIX_FMT_GBRAP16,
+        AV_PIX_FMT_GBRAP, AV_PIX_FMT_GBRAP10, AV_PIX_FMT_GBRAP12, AV_PIX_FMT_GBRAP16,
         AV_PIX_FMT_NONE
     };
 
