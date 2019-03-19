@@ -75,7 +75,12 @@ static av_cold int init(AVFilterContext *context)
         return AVERROR(EIO);
     }
     else{
-        sr_context->model = (sr_context->dnn_module->load_model)(sr_context->model_filename);
+        if (!sr_context->dnn_module->load_model) {
+            av_log(context, AV_LOG_ERROR, "load_model for network was not specified\n");
+            return AVERROR(EIO);
+        } else {
+            sr_context->model = (sr_context->dnn_module->load_model)(sr_context->model_filename);
+        }
     }
     if (!sr_context->model){
         av_log(context, AV_LOG_ERROR, "could not load DNN model\n");
@@ -250,7 +255,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         return AVERROR(EIO);
     }
 
-    sws_scale(sr_context->sws_contexts[2], (const uint8_t **)(&sr_context->output.data),
+    sws_scale(sr_context->sws_contexts[2], (const uint8_t *[4]){(const uint8_t *)sr_context->output.data, 0, 0, 0},
               (const int[4]){sr_context->sws_output_linesize, 0, 0, 0},
               0, out->height, (uint8_t * const*)out->data, out->linesize);
 
