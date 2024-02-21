@@ -23,14 +23,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "libavutil/imgutils.h"
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
 
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct ProSumerContext {
     GetByteContext gb;
@@ -143,22 +143,26 @@ static void vertical_predict(uint32_t *dst, int offset, const uint32_t *src, int
     }
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data,
+static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
                         int *got_frame, AVPacket *avpkt)
 {
     ProSumerContext *s = avctx->priv_data;
-    AVFrame * const frame = data;
     int ret;
 
     if (avpkt->size <= 32)
         return AVERROR_INVALIDDATA;
 
-    memset(s->decbuffer, 0, s->size);
     bytestream2_init(&s->gb, avpkt->data, avpkt->size);
     bytestream2_init_writer(&s->pb, s->decbuffer, s->size);
     ret = decompress(&s->gb, AV_RL32(avpkt->data + 28) >> 1, &s->pb, s->lut);
     if (ret < 0)
         return ret;
+    if (bytestream2_get_bytes_left_p(&s->pb) > s->size * (int64_t)avctx->discard_damaged_percentage / 100)
+        return AVERROR_INVALIDDATA;
+
+    av_assert0(s->size >= bytestream2_get_bytes_left_p(&s->pb));
+    memset(s->decbuffer + bytestream2_tell_p(&s->pb), 0, bytestream2_get_bytes_left_p(&s->pb));
+
     vertical_predict((uint32_t *)s->decbuffer, 0, (uint32_t *)s->initial_line, s->stride, 1);
     vertical_predict((uint32_t *)s->decbuffer, s->stride, (uint32_t *)s->decbuffer, s->stride, avctx->height - 1);
 
@@ -191,7 +195,7 @@ static int decode_frame(AVCodecContext *avctx, void *data,
     }
 
     frame->pict_type = AV_PICTURE_TYPE_I;
-    frame->key_frame = 1;
+    frame->flags |= AV_FRAME_FLAG_KEY;
     *got_frame = 1;
 
     return avpkt->size;
@@ -360,16 +364,15 @@ static av_cold int decode_close(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_prosumer_decoder = {
-    .name           = "prosumer",
-    .long_name      = NULL_IF_CONFIG_SMALL("Brooktree ProSumer Video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_PROSUMER,
+const FFCodec ff_prosumer_decoder = {
+    .p.name         = "prosumer",
+    CODEC_LONG_NAME("Brooktree ProSumer Video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_PROSUMER,
     .priv_data_size = sizeof(ProSumerContext),
     .init           = decode_init,
-    .decode         = decode_frame,
+    FF_CODEC_DECODE_CB(decode_frame),
     .close          = decode_close,
-    .capabilities   = AV_CODEC_CAP_DR1,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE |
-                      FF_CODEC_CAP_INIT_CLEANUP,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

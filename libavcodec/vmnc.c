@@ -25,13 +25,10 @@
  * As Alex Beregszaszi discovered, this is effectively RFB data dump
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-
 #include "libavutil/common.h"
-#include "libavutil/intreadwrite.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "bytestream.h"
 
 enum EncTypes {
@@ -323,8 +320,8 @@ static void reset_buffers(VmncContext *c)
 
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                        int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
@@ -333,12 +330,16 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     uint8_t *outptr;
     int dx, dy, w, h, depth, enc, chunks, res, size_left, ret;
 
-    if ((ret = ff_reget_buffer(avctx, c->pic)) < 0)
+    bytestream2_init(gb, buf, buf_size);
+    bytestream2_skip(gb, 2);
+    chunks = bytestream2_get_be16(gb);
+    if (12LL * chunks > bytestream2_get_bytes_left(gb))
+        return AVERROR_INVALIDDATA;
+
+    if ((ret = ff_reget_buffer(avctx, c->pic, 0)) < 0)
         return ret;
 
-    bytestream2_init(gb, buf, buf_size);
-
-    c->pic->key_frame = 0;
+    c->pic->flags &= ~AV_FRAME_FLAG_KEY;
     c->pic->pict_type = AV_PICTURE_TYPE_P;
 
     // restore screen after cursor
@@ -369,8 +370,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             }
         }
     }
-    bytestream2_skip(gb, 2);
-    chunks = bytestream2_get_be16(gb);
+
     while (chunks--) {
         if (bytestream2_get_bytes_left(gb) < 12) {
             av_log(avctx, AV_LOG_ERROR, "Premature end of data!\n");
@@ -441,7 +441,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             bytestream2_skip(gb, 4);
             break;
         case MAGIC_WMVi: // ServerInitialization struct
-            c->pic->key_frame = 1;
+            c->pic->flags |= AV_FRAME_FLAG_KEY;
             c->pic->pict_type = AV_PICTURE_TYPE_I;
             depth = bytestream2_get_byte(gb);
             if (depth != c->bpp) {
@@ -514,7 +514,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         }
     }
     *got_frame = 1;
-    if ((ret = av_frame_ref(data, c->pic)) < 0)
+    if ((ret = av_frame_ref(rframe, c->pic)) < 0)
         return ret;
 
     /* always report that the buffer was completely consumed */
@@ -569,14 +569,14 @@ static av_cold int decode_end(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_vmnc_decoder = {
-    .name           = "vmnc",
-    .long_name      = NULL_IF_CONFIG_SMALL("VMware Screen Codec / VMware Video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_VMNC,
+const FFCodec ff_vmnc_decoder = {
+    .p.name         = "vmnc",
+    CODEC_LONG_NAME("VMware Screen Codec / VMware Video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_VMNC,
     .priv_data_size = sizeof(VmncContext),
     .init           = decode_init,
     .close          = decode_end,
-    .decode         = decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

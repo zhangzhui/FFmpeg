@@ -33,6 +33,8 @@
 #include "mpeg4audio.h"
 #include "bgmc.h"
 #include "bswapdsp.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "internal.h"
 #include "mlz.h"
 #include "libavutil/samplefmt.h"
@@ -236,6 +238,7 @@ typedef struct ALSDecContext {
     int **raw_mantissa;             ///< decoded mantissa bits of the difference signal
     unsigned char *larray;          ///< buffer to store the output of masked lz decompression
     int *nbits;                     ///< contains the number of bits to read for masked lz decompression for all samples
+    int highest_decoded_channel;
 } ALSDecContext;
 
 
@@ -302,8 +305,8 @@ static av_cold int read_specific_config(ALSDecContext *ctx)
     if ((ret = init_get_bits8(&gb, avctx->extradata, avctx->extradata_size)) < 0)
         return ret;
 
-    config_offset = avpriv_mpeg4audio_get_config(&m4ac, avctx->extradata,
-                                                 avctx->extradata_size * 8, 1);
+    config_offset = avpriv_mpeg4audio_get_config2(&m4ac, avctx->extradata,
+                                                  avctx->extradata_size, 1, avctx);
 
     if (config_offset < 0)
         return AVERROR_INVALIDDATA;
@@ -318,7 +321,13 @@ static av_cold int read_specific_config(ALSDecContext *ctx)
     avctx->sample_rate          = m4ac.sample_rate;
     skip_bits_long(&gb, 32); // sample rate already known
     sconf->samples              = get_bits_long(&gb, 32);
-    avctx->channels             = m4ac.channels;
+
+    if (avctx->ch_layout.nb_channels != m4ac.channels) {
+        av_channel_layout_uninit(&avctx->ch_layout);
+        avctx->ch_layout.order = AV_CHANNEL_ORDER_UNSPEC;
+        avctx->ch_layout.nb_channels = m4ac.channels;
+    }
+
     skip_bits(&gb, 16);      // number of channels already known
     skip_bits(&gb, 3);       // skip file_type
     sconf->resolution           = get_bits(&gb, 3);
@@ -348,6 +357,14 @@ static av_cold int read_specific_config(ALSDecContext *ctx)
     if (als_id != MKBETAG('A','L','S','\0'))
         return AVERROR_INVALIDDATA;
 
+    if (avctx->ch_layout.nb_channels > FF_SANE_NB_CHANNELS) {
+        avpriv_request_sample(avctx, "Huge number of channels");
+        return AVERROR_PATCHWELCOME;
+    }
+
+    if (avctx->ch_layout.nb_channels == 0)
+        return AVERROR_INVALIDDATA;
+
     ctx->cur_frame_length = sconf->frame_length;
 
     // read channel config
@@ -357,26 +374,26 @@ static av_cold int read_specific_config(ALSDecContext *ctx)
 
 
     // read channel sorting
-    if (sconf->chan_sort && avctx->channels > 1) {
-        int chan_pos_bits = av_ceil_log2(avctx->channels);
-        int bits_needed  = avctx->channels * chan_pos_bits + 7;
+    if (sconf->chan_sort && avctx->ch_layout.nb_channels > 1) {
+        int chan_pos_bits = av_ceil_log2(avctx->ch_layout.nb_channels);
+        int bits_needed  = avctx->ch_layout.nb_channels * chan_pos_bits + 7;
         if (get_bits_left(&gb) < bits_needed)
             return AVERROR_INVALIDDATA;
 
-        if (!(sconf->chan_pos = av_malloc_array(avctx->channels, sizeof(*sconf->chan_pos))))
+        if (!(sconf->chan_pos = av_malloc_array(avctx->ch_layout.nb_channels, sizeof(*sconf->chan_pos))))
             return AVERROR(ENOMEM);
 
         ctx->cs_switch = 1;
 
-        for (i = 0; i < avctx->channels; i++) {
+        for (i = 0; i < avctx->ch_layout.nb_channels; i++) {
             sconf->chan_pos[i] = -1;
         }
 
-        for (i = 0; i < avctx->channels; i++) {
+        for (i = 0; i < avctx->ch_layout.nb_channels; i++) {
             int idx;
 
             idx = get_bits(&gb, chan_pos_bits);
-            if (idx >= avctx->channels || sconf->chan_pos[idx] != -1) {
+            if (idx >= avctx->ch_layout.nb_channels || sconf->chan_pos[idx] != -1) {
                 av_log(avctx, AV_LOG_WARNING, "Invalid channel reordering.\n");
                 ctx->cs_switch = 0;
                 break;
@@ -487,7 +504,7 @@ static void parse_bs_info(const uint32_t bs_info, unsigned int n,
 static int32_t decode_rice(GetBitContext *gb, unsigned int k)
 {
     int max = get_bits_left(gb) - k;
-    int q   = get_unary(gb, 0, max);
+    unsigned q = get_unary(gb, 0, max);
     int r   = k ? get_bits1(gb) : !(q & 1);
 
     if (k > 1) {
@@ -507,7 +524,7 @@ static void parcor_to_lpc(unsigned int k, const int32_t *par, int32_t *cof)
     int i, j;
 
     for (i = 0, j = k - 1; i < j; i++, j--) {
-        int tmp1 = ((MUL64(par[k], cof[j]) + (1 << 19)) >> 20);
+        unsigned tmp1 = ((MUL64(par[k], cof[j]) + (1 << 19)) >> 20);
         cof[j]  += ((MUL64(par[k], cof[i]) + (1 << 19)) >> 20);
         cof[i]  += tmp1;
     }
@@ -657,7 +674,7 @@ static int read_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
 
     // do not continue in case of a damaged stream since
     // block_length must be evenly divisible by sub_blocks
-    if (bd->block_length & (sub_blocks - 1)) {
+    if (bd->block_length & (sub_blocks - 1) || bd->block_length <= 0) {
         av_log(avctx, AV_LOG_WARNING,
                "Block length is not evenly divisible by the number of subblocks.\n");
         return AVERROR_INVALIDDATA;
@@ -756,7 +773,7 @@ static int read_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
             }
 
             for (k = 2; k < opt_order; k++)
-                quant_cof[k] = (quant_cof[k] * (1 << 14)) + (add_base << 13);
+                quant_cof[k] = (quant_cof[k] * (1U << 14)) + (add_base << 13);
         }
     }
 
@@ -767,8 +784,8 @@ static int read_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
         if (*bd->use_ltp) {
             int r, c;
 
-            bd->ltp_gain[0]   = decode_rice(gb, 1) << 3;
-            bd->ltp_gain[1]   = decode_rice(gb, 2) << 3;
+            bd->ltp_gain[0]   = decode_rice(gb, 1) * 8;
+            bd->ltp_gain[1]   = decode_rice(gb, 2) * 8;
 
             r                 = get_unary(gb, 0, 4);
             c                 = get_bits(gb, 2);
@@ -779,8 +796,8 @@ static int read_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
 
             bd->ltp_gain[2]   = ltp_gain_values[r][c];
 
-            bd->ltp_gain[3]   = decode_rice(gb, 2) << 3;
-            bd->ltp_gain[4]   = decode_rice(gb, 1) << 3;
+            bd->ltp_gain[3]   = decode_rice(gb, 2) * 8;
+            bd->ltp_gain[4]   = decode_rice(gb, 1) * 8;
 
             *bd->ltp_lag      = get_bits(gb, ctx->ltp_lag_length);
             *bd->ltp_lag     += FFMAX(4, opt_order + 1);
@@ -789,14 +806,20 @@ static int read_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
 
     // read first value and residuals in case of a random access block
     if (bd->ra_block) {
+        start = FFMIN(opt_order, 3);
+        av_assert0(sb_length <= sconf->frame_length);
+        if (sb_length <= start) {
+            // opt_order or sb_length may be corrupted, either way this is unsupported and not well defined in the specification
+            av_log(avctx, AV_LOG_ERROR, "Sub block length smaller or equal start\n");
+            return AVERROR_PATCHWELCOME;
+        }
+
         if (opt_order)
             bd->raw_samples[0] = decode_rice(gb, avctx->bits_per_raw_sample - 4);
         if (opt_order > 1)
             bd->raw_samples[1] = decode_rice(gb, FFMIN(s[0] + 3, ctx->s_max));
         if (opt_order > 2)
             bd->raw_samples[2] = decode_rice(gb, FFMIN(s[0] + 1, ctx->s_max));
-
-        start = FFMIN(opt_order, 3);
     }
 
     // read all residuals
@@ -810,7 +833,9 @@ static int read_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
         unsigned int low;
         unsigned int value;
 
-        ff_bgmc_decode_init(gb, &high, &low, &value);
+        int ret = ff_bgmc_decode_init(gb, &high, &low, &value);
+        if (ret < 0)
+            return ret;
 
         current_res = bd->raw_samples + start;
 
@@ -819,6 +844,9 @@ static int read_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
 
             k    [sb] = s[sb] > b ? s[sb] - b : 0;
             delta[sb] = 5 - s[sb] + k[sb];
+
+            if (k[sb] >= 32)
+                return AVERROR_INVALIDDATA;
 
             ff_bgmc_decode(gb, sb_len, current_res,
                         delta[sb], sx[sb], &high, &low, &value, ctx->bgmc_lut, ctx->bgmc_lut_status);
@@ -861,7 +889,7 @@ static int read_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
                     res >>= 1;
 
                     if (cur_k) {
-                        res  *= 1 << cur_k;
+                        res  *= 1U << cur_k;
                         res  |= get_bits_long(gb, cur_k);
                     }
                 }
@@ -912,7 +940,7 @@ static int decode_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
             y = 1 << 6;
 
             for (base = begin; base < end; base++, tab++)
-                y += MUL64(bd->ltp_gain[tab], raw_samples[base]);
+                y += (uint64_t)MUL64(bd->ltp_gain[tab], raw_samples[base]);
 
             raw_samples[ltp_smp] += y >> 7;
         }
@@ -924,7 +952,7 @@ static int decode_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
             y = 1 << 19;
 
             for (sb = 0; sb < smp; sb++)
-                y += MUL64(lpc_cof[sb], raw_samples[-(sb + 1)]);
+                y += (uint64_t)MUL64(lpc_cof[sb], raw_samples[-(sb + 1)]);
 
             *raw_samples++ -= y >> 20;
             parcor_to_lpc(smp, quant_cof, lpc_cof);
@@ -940,7 +968,7 @@ static int decode_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
 
         // reconstruct difference signal for prediction (joint-stereo)
         if (bd->js_blocks && bd->raw_other) {
-            int32_t *left, *right;
+            uint32_t *left, *right;
 
             if (bd->raw_other > raw_samples) {  // D = R - L
                 left  = raw_samples;
@@ -974,7 +1002,7 @@ static int decode_var_block_data(ALSDecContext *ctx, ALSBlockData *bd)
         y = 1 << 19;
 
         for (sb = -opt_order; sb < 0; sb++)
-            y += MUL64(lpc_cof[sb], raw_samples[sb]);
+            y += (uint64_t)MUL64(lpc_cof[sb], raw_samples[sb]);
 
         *raw_samples -= y >> 20;
     }
@@ -999,6 +1027,10 @@ static int read_block(ALSDecContext *ctx, ALSBlockData *bd)
     ALSSpecificConfig *sconf = &ctx->sconf;
 
     *bd->shift_lsbs = 0;
+
+    if (get_bits_left(gb) < 7)
+        return AVERROR_INVALIDDATA;
+
     // read block type flag and read the samples accordingly
     if (get_bits1(gb)) {
         ret = read_var_block_data(ctx, bd);
@@ -1033,7 +1065,7 @@ static int decode_block(ALSDecContext *ctx, ALSBlockData *bd)
 
     if (*bd->shift_lsbs)
         for (smp = 0; smp < bd->block_length; smp++)
-            bd->raw_samples[smp] <<= *bd->shift_lsbs;
+            bd->raw_samples[smp] = (unsigned)bd->raw_samples[smp] << *bd->shift_lsbs;
 
     return 0;
 }
@@ -1169,10 +1201,10 @@ static int decode_blocks(ALSDecContext *ctx, unsigned int ra_frame,
                 av_log(ctx->avctx, AV_LOG_WARNING, "Invalid channel pair.\n");
 
             for (s = 0; s < div_blocks[b]; s++)
-                bd[0].raw_samples[s] = bd[1].raw_samples[s] - bd[0].raw_samples[s];
+                bd[0].raw_samples[s] = bd[1].raw_samples[s] - (unsigned)bd[0].raw_samples[s];
         } else if (bd[1].js_blocks) {
             for (s = 0; s < div_blocks[b]; s++)
-                bd[1].raw_samples[s] = bd[1].raw_samples[s] + bd[0].raw_samples[s];
+                bd[1].raw_samples[s] = bd[1].raw_samples[s] + (unsigned)bd[0].raw_samples[s];
         }
 
         offset  += div_blocks[b];
@@ -1207,7 +1239,7 @@ static int read_channel_data(ALSDecContext *ctx, ALSChannelData *cd, int c)
 {
     GetBitContext *gb       = &ctx->gb;
     ALSChannelData *current = cd;
-    unsigned int channels   = ctx->avctx->channels;
+    unsigned int channels   = ctx->avctx->ch_layout.nb_channels;
     int entries             = 0;
 
     while (entries < channels && !(current->stop_flag = get_bits1(gb))) {
@@ -1256,7 +1288,7 @@ static int revert_channel_correlation(ALSDecContext *ctx, ALSBlockData *bd,
 {
     ALSChannelData *ch = cd[c];
     unsigned int   dep = 0;
-    unsigned int channels = ctx->avctx->channels;
+    unsigned int channels = ctx->avctx->ch_layout.nb_channels;
     unsigned int channel_size = ctx->sconf.frame_length + ctx->sconf.max_order;
 
     if (reverted[c])
@@ -1379,6 +1411,9 @@ static SoftFloat_IEEE754 multiply(SoftFloat_IEEE754 a, SoftFloat_IEEE754 b) {
     mantissa_temp = (uint64_t)a.mant * (uint64_t)b.mant;
     mask_64       = (uint64_t)0x1 << 47;
 
+    if (!mantissa_temp)
+        return FLOAT_0;
+
     // Count the valid bit count
     while (!(mantissa_temp & mask_64) && mask_64) {
         bit_count--;
@@ -1395,7 +1430,11 @@ static SoftFloat_IEEE754 multiply(SoftFloat_IEEE754 a, SoftFloat_IEEE754 b) {
         }
     }
 
-    mantissa = (unsigned int)(mantissa_temp >> cutoff_bit_count);
+    if (cutoff_bit_count >= 0) {
+        mantissa = (unsigned int)(mantissa_temp >> cutoff_bit_count);
+    } else {
+        mantissa = (unsigned int)(mantissa_temp <<-cutoff_bit_count);
+    }
 
     // Need one more shift?
     if (mantissa & 0x01000000ul) {
@@ -1407,7 +1446,7 @@ static SoftFloat_IEEE754 multiply(SoftFloat_IEEE754 a, SoftFloat_IEEE754 b) {
         return_val = 0x80000000U;
     }
 
-    return_val |= (a.exp + b.exp + bit_count - 47) << 23;
+    return_val |= ((unsigned)av_clip(a.exp + b.exp + bit_count - 47, -126, 127) << 23) & 0x7F800000;
     return_val |= mantissa;
     return av_bits2sf_ieee754(return_val);
 }
@@ -1447,12 +1486,15 @@ static int read_diff_float_data(ALSDecContext *ctx, unsigned int ra_frame) {
     use_acf = get_bits1(gb);
 
     if (ra_frame) {
-        memset(last_acf_mantissa, 0, avctx->channels * sizeof(*last_acf_mantissa));
-        memset(last_shift_value,  0, avctx->channels * sizeof(*last_shift_value) );
+        memset(last_acf_mantissa, 0, avctx->ch_layout.nb_channels * sizeof(*last_acf_mantissa));
+        memset(last_shift_value,  0, avctx->ch_layout.nb_channels * sizeof(*last_shift_value) );
         ff_mlz_flush_dict(ctx->mlz);
     }
 
-    for (c = 0; c < avctx->channels; ++c) {
+    if (avctx->ch_layout.nb_channels * 8 > get_bits_left(gb))
+        return AVERROR_INVALIDDATA;
+
+    for (c = 0; c < avctx->ch_layout.nb_channels; ++c) {
         if (use_acf) {
             //acf_flag
             if (get_bits1(gb)) {
@@ -1601,8 +1643,9 @@ static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
     AVCodecContext *avctx    = ctx->avctx;
     GetBitContext *gb = &ctx->gb;
     unsigned int div_blocks[32];                ///< block sizes.
-    unsigned int c;
+    int c;
     unsigned int js_blocks[2];
+    int channels = avctx->ch_layout.nb_channels;
     uint32_t bs_info = 0;
     int ret;
 
@@ -1617,8 +1660,9 @@ static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
 
     if (!sconf->mc_coding || ctx->js_switch) {
         int independent_bs = !sconf->joint_stereo;
-
-        for (c = 0; c < avctx->channels; c++) {
+        if (get_bits_left(gb) < 7*channels*ctx->num_blocks)
+            return AVERROR_INVALIDDATA;
+        for (c = 0; c < channels; c++) {
             js_blocks[0] = 0;
             js_blocks[1] = 0;
 
@@ -1631,7 +1675,7 @@ static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
                     independent_bs = 2;
 
             // if this is the last channel, it has to be decoded independently
-            if (c == avctx->channels - 1 || (c & 1))
+            if (c == channels - 1 || (c & 1))
                 independent_bs = 1;
 
             if (independent_bs) {
@@ -1652,6 +1696,7 @@ static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
             memmove(ctx->raw_samples[c] - sconf->max_order,
                     ctx->raw_samples[c] - sconf->max_order + sconf->frame_length,
                     sizeof(*ctx->raw_samples[c]) * sconf->max_order);
+            ctx->highest_decoded_channel = c;
         }
     } else { // multi-channel coding
         ALSBlockData   bd = { 0 };
@@ -1659,13 +1704,13 @@ static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
         int            *reverted_channels = ctx->reverted_channels;
         unsigned int   offset             = 0;
 
-        for (c = 0; c < avctx->channels; c++)
+        for (c = 0; c < channels; c++)
             if (ctx->chan_data[c] < ctx->chan_data_buffer) {
                 av_log(ctx->avctx, AV_LOG_ERROR, "Invalid channel data.\n");
                 return AVERROR_INVALIDDATA;
             }
 
-        memset(reverted_channels, 0, sizeof(*reverted_channels) * avctx->channels);
+        memset(reverted_channels, 0, sizeof(*reverted_channels) * channels);
 
         bd.ra_block         = ra_frame;
         bd.prev_raw_samples = ctx->prev_raw_samples;
@@ -1681,7 +1726,7 @@ static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
                 continue;
             }
 
-            for (c = 0; c < avctx->channels; c++) {
+            for (c = 0; c < channels; c++) {
                 bd.const_block = ctx->const_block + c;
                 bd.shift_lsbs  = ctx->shift_lsbs + c;
                 bd.opt_order   = ctx->opt_order + c;
@@ -1700,13 +1745,13 @@ static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
                     return ret;
             }
 
-            for (c = 0; c < avctx->channels; c++) {
+            for (c = 0; c < channels; c++) {
                 ret = revert_channel_correlation(ctx, &bd, ctx->chan_data,
                                                  reverted_channels, offset, c);
                 if (ret < 0)
                     return ret;
             }
-            for (c = 0; c < avctx->channels; c++) {
+            for (c = 0; c < channels; c++) {
                 bd.const_block = ctx->const_block + c;
                 bd.shift_lsbs  = ctx->shift_lsbs + c;
                 bd.opt_order   = ctx->opt_order + c;
@@ -1720,15 +1765,17 @@ static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
 
                 if ((ret = decode_block(ctx, &bd)) < 0)
                     return ret;
+
+                ctx->highest_decoded_channel = FFMAX(ctx->highest_decoded_channel, c);
             }
 
-            memset(reverted_channels, 0, avctx->channels * sizeof(*reverted_channels));
+            memset(reverted_channels, 0, channels * sizeof(*reverted_channels));
             offset      += div_blocks[b];
             bd.ra_block  = 0;
         }
 
         // store carryover raw samples
-        for (c = 0; c < avctx->channels; c++)
+        for (c = 0; c < channels; c++)
             memmove(ctx->raw_samples[c] - sconf->max_order,
                     ctx->raw_samples[c] - sconf->max_order + sconf->frame_length,
                     sizeof(*ctx->raw_samples[c]) * sconf->max_order);
@@ -1749,15 +1796,15 @@ static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
 
 /** Decode an ALS frame.
  */
-static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame_ptr,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                        int *got_frame_ptr, AVPacket *avpkt)
 {
     ALSDecContext *ctx       = avctx->priv_data;
-    AVFrame *frame           = data;
     ALSSpecificConfig *sconf = &ctx->sconf;
     const uint8_t *buffer    = avpkt->data;
     int buffer_size          = avpkt->size;
     int invalid_frame, ret;
+    int channels = avctx->ch_layout.nb_channels;
     unsigned int c, sample, ra_frame, bytes_read, shift;
 
     if ((ret = init_get_bits8(&ctx->gb, buffer, buffer_size)) < 0)
@@ -1776,10 +1823,17 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame_ptr,
     else
         ctx->cur_frame_length = sconf->frame_length;
 
+    ctx->highest_decoded_channel = -1;
     // decode the frame data
     if ((invalid_frame = read_frame_data(ctx, ra_frame)) < 0)
         av_log(ctx->avctx, AV_LOG_WARNING,
                "Reading frame data failed. Skipping RA unit.\n");
+
+    if (ctx->highest_decoded_channel == -1) {
+        av_log(ctx->avctx, AV_LOG_WARNING,
+               "No channel data decoded.\n");
+        return AVERROR_INVALIDDATA;
+    }
 
     ctx->frame_id++;
 
@@ -1792,15 +1846,17 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame_ptr,
     #define INTERLEAVE_OUTPUT(bps)                                                   \
     {                                                                                \
         int##bps##_t *dest = (int##bps##_t*)frame->data[0];                          \
+        int32_t *raw_samples = ctx->raw_samples[0];                                  \
+        int raw_step = channels > 1 ? ctx->raw_samples[1] - raw_samples : 1;         \
         shift = bps - ctx->avctx->bits_per_raw_sample;                               \
         if (!ctx->cs_switch) {                                                       \
             for (sample = 0; sample < ctx->cur_frame_length; sample++)               \
-                for (c = 0; c < avctx->channels; c++)                                \
-                    *dest++ = ctx->raw_samples[c][sample] << shift;                  \
+                for (c = 0; c < channels; c++)                                       \
+                    *dest++ = raw_samples[c*raw_step + sample] * (1U << shift);      \
         } else {                                                                     \
             for (sample = 0; sample < ctx->cur_frame_length; sample++)               \
-                for (c = 0; c < avctx->channels; c++)                                \
-                    *dest++ = ctx->raw_samples[sconf->chan_pos[c]][sample] << shift; \
+                for (c = 0; c < channels; c++)                                       \
+                    *dest++ = raw_samples[sconf->chan_pos[c]*raw_step + sample] * (1U << shift);\
         }                                                                            \
     }
 
@@ -1818,7 +1874,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame_ptr,
             int32_t *src = (int32_t *)frame->data[0];
 
             for (sample = 0;
-                 sample < ctx->cur_frame_length * avctx->channels;
+                 sample < ctx->cur_frame_length * channels;
                  sample++) {
                 int32_t v;
 
@@ -1839,13 +1895,13 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame_ptr,
                     int16_t *src  = (int16_t*) frame->data[0];
                     int16_t *dest = (int16_t*) ctx->crc_buffer;
                     for (sample = 0;
-                         sample < ctx->cur_frame_length * avctx->channels;
+                         sample < ctx->cur_frame_length * channels;
                          sample++)
                         *dest++ = av_bswap16(src[sample]);
                 } else {
                     ctx->bdsp.bswap_buf((uint32_t *) ctx->crc_buffer,
                                         (uint32_t *) frame->data[0],
-                                        ctx->cur_frame_length * avctx->channels);
+                                        ctx->cur_frame_length * channels);
                 }
                 crc_source = ctx->crc_buffer;
             } else {
@@ -1853,7 +1909,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame_ptr,
             }
 
             ctx->crc = av_crc(ctx->crc_table, ctx->crc, crc_source,
-                              ctx->cur_frame_length * avctx->channels *
+                              ctx->cur_frame_length * channels *
                               av_get_bytes_per_sample(avctx->sample_fmt));
         }
 
@@ -1916,7 +1972,7 @@ static av_cold int decode_end(AVCodecContext *avctx)
     av_freep(&ctx->shift_value);
     av_freep(&ctx->last_shift_value);
     if (ctx->raw_mantissa) {
-        for (i = 0; i < avctx->channels; i++) {
+        for (i = 0; i < avctx->ch_layout.nb_channels; i++) {
             av_freep(&ctx->raw_mantissa[i]);
         }
         av_freep(&ctx->raw_mantissa);
@@ -1935,6 +1991,7 @@ static av_cold int decode_init(AVCodecContext *avctx)
     unsigned int c;
     unsigned int channel_size;
     int num_buffers, ret;
+    int channels;
     ALSDecContext *ctx = avctx->priv_data;
     ALSSpecificConfig *sconf = &ctx->sconf;
     ctx->avctx = avctx;
@@ -1946,17 +2003,18 @@ static av_cold int decode_init(AVCodecContext *avctx)
 
     if ((ret = read_specific_config(ctx)) < 0) {
         av_log(avctx, AV_LOG_ERROR, "Reading ALSSpecificConfig failed.\n");
-        goto fail;
+        return ret;
     }
+    channels = avctx->ch_layout.nb_channels;
 
     if ((ret = check_specific_config(ctx)) < 0) {
-        goto fail;
+        return ret;
     }
 
     if (sconf->bgmc) {
         ret = ff_bgmc_init(avctx, &ctx->bgmc_lut, &ctx->bgmc_lut_status);
         if (ret < 0)
-            goto fail;
+            return ret;
     }
     if (sconf->floating) {
         avctx->sample_fmt          = AV_SAMPLE_FMT_FLT;
@@ -1968,8 +2026,7 @@ static av_cold int decode_init(AVCodecContext *avctx)
         if (avctx->bits_per_raw_sample > 32) {
             av_log(avctx, AV_LOG_ERROR, "Bits per raw sample %d larger than 32.\n",
                    avctx->bits_per_raw_sample);
-            ret = AVERROR_INVALIDDATA;
-            goto fail;
+            return AVERROR_INVALIDDATA;
         }
     }
 
@@ -1983,7 +2040,9 @@ static av_cold int decode_init(AVCodecContext *avctx)
                               (avctx->sample_rate >= 192000);
 
     // allocate quantized parcor coefficient buffer
-    num_buffers = sconf->mc_coding ? avctx->channels : 1;
+    num_buffers = sconf->mc_coding ? channels : 1;
+    if (num_buffers * (uint64_t)num_buffers > INT_MAX) // protect chan_data_buffer allocation
+        return AVERROR_INVALIDDATA;
 
     ctx->quant_cof        = av_malloc_array(num_buffers, sizeof(*ctx->quant_cof));
     ctx->lpc_cof          = av_malloc_array(num_buffers, sizeof(*ctx->lpc_cof));
@@ -1998,8 +2057,7 @@ static av_cold int decode_init(AVCodecContext *avctx)
         !ctx->quant_cof_buffer       || !ctx->lpc_cof_buffer ||
         !ctx->lpc_cof_reversed_buffer) {
         av_log(avctx, AV_LOG_ERROR, "Allocating buffer memory failed.\n");
-        ret = AVERROR(ENOMEM);
-        goto fail;
+        return AVERROR(ENOMEM);
     }
 
     // assign quantized parcor coefficient buffers
@@ -2013,7 +2071,7 @@ static av_cold int decode_init(AVCodecContext *avctx)
     ctx->shift_lsbs      = av_malloc_array(num_buffers, sizeof(*ctx->shift_lsbs));
     ctx->opt_order       = av_malloc_array(num_buffers, sizeof(*ctx->opt_order));
     ctx->store_prev_samples = av_malloc_array(num_buffers, sizeof(*ctx->store_prev_samples));
-    ctx->use_ltp         = av_mallocz_array(num_buffers, sizeof(*ctx->use_ltp));
+    ctx->use_ltp         = av_calloc(num_buffers, sizeof(*ctx->use_ltp));
     ctx->ltp_lag         = av_malloc_array(num_buffers, sizeof(*ctx->ltp_lag));
     ctx->ltp_gain        = av_malloc_array(num_buffers, sizeof(*ctx->ltp_gain));
     ctx->ltp_gain_buffer = av_malloc_array(num_buffers * 5, sizeof(*ctx->ltp_gain_buffer));
@@ -2023,8 +2081,7 @@ static av_cold int decode_init(AVCodecContext *avctx)
         !ctx->use_ltp  || !ctx->ltp_lag ||
         !ctx->ltp_gain || !ctx->ltp_gain_buffer) {
         av_log(avctx, AV_LOG_ERROR, "Allocating buffer memory failed.\n");
-        ret = AVERROR(ENOMEM);
-        goto fail;
+        return AVERROR(ENOMEM);
     }
 
     for (c = 0; c < num_buffers; c++)
@@ -2032,17 +2089,15 @@ static av_cold int decode_init(AVCodecContext *avctx)
 
     // allocate and assign channel data buffer for mcc mode
     if (sconf->mc_coding) {
-        ctx->chan_data_buffer  = av_mallocz_array(num_buffers * num_buffers,
-                                                 sizeof(*ctx->chan_data_buffer));
-        ctx->chan_data         = av_mallocz_array(num_buffers,
-                                                 sizeof(*ctx->chan_data));
+        ctx->chan_data_buffer  = av_calloc(num_buffers * num_buffers,
+                                           sizeof(*ctx->chan_data_buffer));
+        ctx->chan_data         = av_calloc(num_buffers, sizeof(*ctx->chan_data));
         ctx->reverted_channels = av_malloc_array(num_buffers,
                                                  sizeof(*ctx->reverted_channels));
 
         if (!ctx->chan_data_buffer || !ctx->chan_data || !ctx->reverted_channels) {
             av_log(avctx, AV_LOG_ERROR, "Allocating buffer memory failed.\n");
-            ret = AVERROR(ENOMEM);
-            goto fail;
+            return AVERROR(ENOMEM);
         }
 
         for (c = 0; c < num_buffers; c++)
@@ -2053,18 +2108,12 @@ static av_cold int decode_init(AVCodecContext *avctx)
         ctx->reverted_channels = NULL;
     }
 
-    channel_size      = sconf->frame_length + sconf->max_order;
-
-    ctx->prev_raw_samples = av_malloc_array(sconf->max_order, sizeof(*ctx->prev_raw_samples));
-    ctx->raw_buffer       = av_mallocz_array(avctx->channels * channel_size, sizeof(*ctx->raw_buffer));
-    ctx->raw_samples      = av_malloc_array(avctx->channels, sizeof(*ctx->raw_samples));
-
     if (sconf->floating) {
-        ctx->acf               = av_malloc_array(avctx->channels, sizeof(*ctx->acf));
-        ctx->shift_value       = av_malloc_array(avctx->channels, sizeof(*ctx->shift_value));
-        ctx->last_shift_value  = av_malloc_array(avctx->channels, sizeof(*ctx->last_shift_value));
-        ctx->last_acf_mantissa = av_malloc_array(avctx->channels, sizeof(*ctx->last_acf_mantissa));
-        ctx->raw_mantissa      = av_mallocz_array(avctx->channels, sizeof(*ctx->raw_mantissa));
+        ctx->acf               = av_malloc_array(channels, sizeof(*ctx->acf));
+        ctx->shift_value       = av_malloc_array(channels, sizeof(*ctx->shift_value));
+        ctx->last_shift_value  = av_malloc_array(channels, sizeof(*ctx->last_shift_value));
+        ctx->last_acf_mantissa = av_malloc_array(channels, sizeof(*ctx->last_acf_mantissa));
+        ctx->raw_mantissa      = av_calloc(channels, sizeof(*ctx->raw_mantissa));
 
         ctx->larray = av_malloc_array(ctx->cur_frame_length * 4, sizeof(*ctx->larray));
         ctx->nbits  = av_malloc_array(ctx->cur_frame_length, sizeof(*ctx->nbits));
@@ -2073,51 +2122,51 @@ static av_cold int decode_init(AVCodecContext *avctx)
         if (!ctx->mlz || !ctx->acf || !ctx->shift_value || !ctx->last_shift_value
             || !ctx->last_acf_mantissa || !ctx->raw_mantissa) {
             av_log(avctx, AV_LOG_ERROR, "Allocating buffer memory failed.\n");
-            ret = AVERROR(ENOMEM);
-            goto fail;
+            return AVERROR(ENOMEM);
         }
 
-        ff_mlz_init_dict(avctx, ctx->mlz);
+        ret = ff_mlz_init_dict(avctx, ctx->mlz);
+        if (ret < 0)
+            return ret;
         ff_mlz_flush_dict(ctx->mlz);
 
-        for (c = 0; c < avctx->channels; ++c) {
-            ctx->raw_mantissa[c] = av_mallocz_array(ctx->cur_frame_length, sizeof(**ctx->raw_mantissa));
+        for (c = 0; c < channels; ++c) {
+            ctx->raw_mantissa[c] = av_calloc(ctx->cur_frame_length, sizeof(**ctx->raw_mantissa));
         }
     }
 
+    channel_size      = sconf->frame_length + sconf->max_order;
+
     // allocate previous raw sample buffer
+    ctx->prev_raw_samples = av_malloc_array(sconf->max_order, sizeof(*ctx->prev_raw_samples));
+    ctx->raw_buffer       = av_calloc(channels * channel_size, sizeof(*ctx->raw_buffer));
+    ctx->raw_samples      = av_malloc_array(channels, sizeof(*ctx->raw_samples));
     if (!ctx->prev_raw_samples || !ctx->raw_buffer|| !ctx->raw_samples) {
         av_log(avctx, AV_LOG_ERROR, "Allocating buffer memory failed.\n");
-        ret = AVERROR(ENOMEM);
-        goto fail;
+        return AVERROR(ENOMEM);
     }
 
     // assign raw samples buffers
     ctx->raw_samples[0] = ctx->raw_buffer + sconf->max_order;
-    for (c = 1; c < avctx->channels; c++)
+    for (c = 1; c < channels; c++)
         ctx->raw_samples[c] = ctx->raw_samples[c - 1] + channel_size;
 
     // allocate crc buffer
     if (HAVE_BIGENDIAN != sconf->msb_first && sconf->crc_enabled &&
         (avctx->err_recognition & (AV_EF_CRCCHECK|AV_EF_CAREFUL))) {
         ctx->crc_buffer = av_malloc_array(ctx->cur_frame_length *
-                                          avctx->channels *
+                                          channels *
                                           av_get_bytes_per_sample(avctx->sample_fmt),
                                           sizeof(*ctx->crc_buffer));
         if (!ctx->crc_buffer) {
             av_log(avctx, AV_LOG_ERROR, "Allocating buffer memory failed.\n");
-            ret = AVERROR(ENOMEM);
-            goto fail;
+            return AVERROR(ENOMEM);
         }
     }
 
     ff_bswapdsp_init(&ctx->bdsp);
 
     return 0;
-
-fail:
-    decode_end(avctx);
-    return ret;
 }
 
 
@@ -2131,15 +2180,20 @@ static av_cold void flush(AVCodecContext *avctx)
 }
 
 
-AVCodec ff_als_decoder = {
-    .name           = "als",
-    .long_name      = NULL_IF_CONFIG_SMALL("MPEG-4 Audio Lossless Coding (ALS)"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_MP4ALS,
+const FFCodec ff_als_decoder = {
+    .p.name         = "als",
+    CODEC_LONG_NAME("MPEG-4 Audio Lossless Coding (ALS)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_MP4ALS,
     .priv_data_size = sizeof(ALSDecContext),
     .init           = decode_init,
     .close          = decode_end,
-    .decode         = decode_frame,
+    FF_CODEC_DECODE_CB(decode_frame),
     .flush          = flush,
-    .capabilities   = AV_CODEC_CAP_SUBFRAMES | AV_CODEC_CAP_DR1,
+    .p.capabilities =
+#if FF_API_SUBFRAMES
+                      AV_CODEC_CAP_SUBFRAMES |
+#endif
+                      AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

@@ -21,10 +21,8 @@
 
 #include "libavutil/opt.h"
 #include "avformat.h"
-#include "avio_internal.h"
 #include "url.h"
 
-#include "internal.h"
 #include "rtpdec.h"
 #include "srtp.h"
 
@@ -59,8 +57,7 @@ static int srtp_close(URLContext *h)
     SRTPProtoContext *s = h->priv_data;
     ff_srtp_free(&s->srtp_out);
     ff_srtp_free(&s->srtp_in);
-    ffurl_close(s->rtp_hd);
-    s->rtp_hd = NULL;
+    ffurl_closep(&s->rtp_hd);
     return 0;
 }
 

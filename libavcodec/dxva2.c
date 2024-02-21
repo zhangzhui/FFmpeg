@@ -20,10 +20,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <assert.h>
 #include <string.h>
 #include <initguid.h>
 
+#include "libavutil/avassert.h"
 #include "libavutil/common.h"
 #include "libavutil/log.h"
 #include "libavutil/time.h"
@@ -45,6 +45,7 @@ DEFINE_GUID(ff_DXVA2_ModeHEVC_VLD_Main,  0x5b11d51b, 0x2f4c,0x4452,0xbc,0xc3,0x0
 DEFINE_GUID(ff_DXVA2_ModeHEVC_VLD_Main10,0x107af0e0, 0xef1a,0x4d19,0xab,0xa8,0x67,0xa1,0x63,0x07,0x3d,0x13);
 DEFINE_GUID(ff_DXVA2_ModeVP9_VLD_Profile0,0x463707f8,0xa1d0,0x4585,0x87,0x6d,0x83,0xaa,0x6d,0x60,0xb8,0x9e);
 DEFINE_GUID(ff_DXVA2_ModeVP9_VLD_10bit_Profile2,0xa4c749ef,0x6ecf,0x48aa,0x84,0x48,0x50,0xa7,0xa1,0x16,0x5f,0xf7);
+DEFINE_GUID(ff_DXVA2_ModeAV1_VLD_Profile0,0xb8be4ccb,0xcf53,0x46ba,0x8d,0x59,0xd6,0xb8,0xa6,0xda,0x5d,0x2a);
 DEFINE_GUID(ff_DXVA2_NoEncrypt,          0x1b81beD0, 0xa0c7,0x11d3,0xb9,0x84,0x00,0xc0,0x4f,0x2e,0x73,0xc5);
 DEFINE_GUID(ff_GUID_NULL,                0x00000000, 0x0000,0x0000,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
 DEFINE_GUID(ff_IID_IDirectXVideoDecoderService, 0xfc51a551,0xd5e7,0x11d9,0xaf,0x55,0x00,0x05,0x4e,0x43,0xff,0x02);
@@ -52,26 +53,28 @@ DEFINE_GUID(ff_IID_IDirectXVideoDecoderService, 0xfc51a551,0xd5e7,0x11d9,0xaf,0x
 typedef struct dxva_mode {
     const GUID     *guid;
     enum AVCodecID codec;
-    // List of supported profiles, terminated by a FF_PROFILE_UNKNOWN entry.
+    // List of supported profiles, terminated by a AV_PROFILE_UNKNOWN entry.
     // If NULL, don't check profile.
     const int      *profiles;
 } dxva_mode;
 
-static const int prof_mpeg2_main[]   = {FF_PROFILE_MPEG2_SIMPLE,
-                                        FF_PROFILE_MPEG2_MAIN,
-                                        FF_PROFILE_UNKNOWN};
-static const int prof_h264_high[]    = {FF_PROFILE_H264_CONSTRAINED_BASELINE,
-                                        FF_PROFILE_H264_MAIN,
-                                        FF_PROFILE_H264_HIGH,
-                                        FF_PROFILE_UNKNOWN};
-static const int prof_hevc_main[]    = {FF_PROFILE_HEVC_MAIN,
-                                        FF_PROFILE_UNKNOWN};
-static const int prof_hevc_main10[]  = {FF_PROFILE_HEVC_MAIN_10,
-                                        FF_PROFILE_UNKNOWN};
-static const int prof_vp9_profile0[] = {FF_PROFILE_VP9_0,
-                                        FF_PROFILE_UNKNOWN};
-static const int prof_vp9_profile2[] = {FF_PROFILE_VP9_2,
-                                        FF_PROFILE_UNKNOWN};
+static const int prof_mpeg2_main[]   = {AV_PROFILE_MPEG2_SIMPLE,
+                                        AV_PROFILE_MPEG2_MAIN,
+                                        AV_PROFILE_UNKNOWN};
+static const int prof_h264_high[]    = {AV_PROFILE_H264_CONSTRAINED_BASELINE,
+                                        AV_PROFILE_H264_MAIN,
+                                        AV_PROFILE_H264_HIGH,
+                                        AV_PROFILE_UNKNOWN};
+static const int prof_hevc_main[]    = {AV_PROFILE_HEVC_MAIN,
+                                        AV_PROFILE_UNKNOWN};
+static const int prof_hevc_main10[]  = {AV_PROFILE_HEVC_MAIN_10,
+                                        AV_PROFILE_UNKNOWN};
+static const int prof_vp9_profile0[] = {AV_PROFILE_VP9_0,
+                                        AV_PROFILE_UNKNOWN};
+static const int prof_vp9_profile2[] = {AV_PROFILE_VP9_2,
+                                        AV_PROFILE_UNKNOWN};
+static const int prof_av1_profile0[] = {AV_PROFILE_AV1_MAIN,
+                                        AV_PROFILE_UNKNOWN};
 
 static const dxva_mode dxva_modes[] = {
     /* MPEG-2 */
@@ -97,6 +100,9 @@ static const dxva_mode dxva_modes[] = {
     /* VP8/9 */
     { &ff_DXVA2_ModeVP9_VLD_Profile0,       AV_CODEC_ID_VP9, prof_vp9_profile0 },
     { &ff_DXVA2_ModeVP9_VLD_10bit_Profile2, AV_CODEC_ID_VP9, prof_vp9_profile2 },
+
+    /* AV1 */
+    { &ff_DXVA2_ModeAV1_VLD_Profile0,       AV_CODEC_ID_AV1, prof_av1_profile0 },
 
     { NULL,                          0 },
 };
@@ -193,7 +199,7 @@ static int dxva_check_codec_compatibility(AVCodecContext *avctx, const dxva_mode
 
     if (mode->profiles && !(avctx->hwaccel_flags & AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH)) {
         int i, found = 0;
-        for (i = 0; mode->profiles[i] != FF_PROFILE_UNKNOWN; i++) {
+        for (i = 0; mode->profiles[i] != AV_PROFILE_UNKNOWN; i++) {
             if (avctx->profile == mode->profiles[i]) {
                 found = 1;
                 break;
@@ -509,7 +515,7 @@ static int d3d11va_create_decoder(AVCodecContext *avctx)
     if (ret < 0)
         return AVERROR(EINVAL);
 
-    sctx->d3d11_views = av_mallocz_array(texdesc.ArraySize, sizeof(sctx->d3d11_views[0]));
+    sctx->d3d11_views = av_calloc(texdesc.ArraySize, sizeof(sctx->d3d11_views[0]));
     if (!sctx->d3d11_views)
         return AVERROR(ENOMEM);
     sctx->nb_d3d11_views = texdesc.ArraySize;
@@ -604,7 +610,7 @@ int ff_dxva2_common_frame_params(AVCodecContext *avctx,
         surface_alignment = 32;
     /* the HEVC DXVA2 spec asks for 128 pixel aligned surfaces to ensure
     all coding features have enough room to work with */
-    else if (avctx->codec_id == AV_CODEC_ID_HEVC)
+    else if (avctx->codec_id == AV_CODEC_ID_HEVC || avctx->codec_id == AV_CODEC_ID_AV1)
         surface_alignment = 128;
     else
         surface_alignment = 16;
@@ -615,7 +621,7 @@ int ff_dxva2_common_frame_params(AVCodecContext *avctx,
     /* add surfaces based on number of possible refs */
     if (avctx->codec_id == AV_CODEC_ID_H264 || avctx->codec_id == AV_CODEC_ID_HEVC)
         num_surfaces += 16;
-    else if (avctx->codec_id == AV_CODEC_ID_VP9)
+    else if (avctx->codec_id == AV_CODEC_ID_VP9 || avctx->codec_id == AV_CODEC_ID_AV1)
         num_surfaces += 8;
     else
         num_surfaces += 2;
@@ -762,12 +768,17 @@ static void *get_surface(const AVCodecContext *avctx, const AVFrame *frame)
 }
 
 unsigned ff_dxva2_get_surface_index(const AVCodecContext *avctx,
-                                    const AVDXVAContext *ctx,
-                                    const AVFrame *frame)
+                                    AVDXVAContext *ctx, const AVFrame *frame,
+                                    int curr)
 {
     void *surface = get_surface(avctx, frame);
     unsigned i;
 
+#if CONFIG_D3D12VA
+    if (avctx->pix_fmt == AV_PIX_FMT_D3D12) {
+        return ff_d3d12va_get_surface_index(avctx, (D3D12VADecodeContext *)ctx, frame, curr);
+    }
+#endif
 #if CONFIG_D3D11VA
     if (avctx->pix_fmt == AV_PIX_FMT_D3D11)
         return (intptr_t)frame->data[1];
@@ -784,7 +795,7 @@ unsigned ff_dxva2_get_surface_index(const AVCodecContext *avctx,
     }
 #endif
 
-    assert(0);
+    av_log((AVCodecContext *)avctx, AV_LOG_WARNING, "Could not get surface index. Using 0 instead.\n");
     return 0;
 }
 
@@ -1001,7 +1012,7 @@ int ff_dxva2_common_end_frame(AVCodecContext *avctx, AVFrame *frame,
 
     /* TODO Film Grain when possible */
 
-    assert(buffer_count == 1 + (qm_size > 0) + 2);
+    av_assert0(buffer_count == 1 + (qm_size > 0) + 2);
 
 #if CONFIG_D3D11VA
     if (ff_dxva2_is_d3d11(avctx))
@@ -1049,4 +1060,24 @@ int ff_dxva2_is_d3d11(const AVCodecContext *avctx)
                avctx->pix_fmt == AV_PIX_FMT_D3D11;
     else
         return 0;
+}
+
+unsigned *ff_dxva2_get_report_id(const AVCodecContext *avctx, AVDXVAContext *ctx)
+{
+    unsigned *report_id = NULL;
+
+#if CONFIG_D3D12VA
+    if (avctx->pix_fmt == AV_PIX_FMT_D3D12)
+        report_id = &ctx->d3d12va.report_id;
+#endif
+#if CONFIG_D3D11VA
+    if (ff_dxva2_is_d3d11(avctx))
+        report_id = &ctx->d3d11va.report_id;
+#endif
+#if CONFIG_DXVA2
+    if (avctx->pix_fmt == AV_PIX_FMT_DXVA2_VLD)
+        report_id = &ctx->dxva2.report_id;
+#endif
+
+    return report_id;
 }

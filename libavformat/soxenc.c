@@ -34,6 +34,7 @@
 #include "libavutil/dict.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "mux.h"
 #include "rawenc.h"
 #include "sox.h"
 
@@ -61,14 +62,14 @@ static int sox_write_header(AVFormatContext *s)
         avio_wl32(pb, sox->header_size);
         avio_wl64(pb, 0); /* number of samples */
         avio_wl64(pb, av_double2int(par->sample_rate));
-        avio_wl32(pb, par->channels);
+        avio_wl32(pb, par->ch_layout.nb_channels);
         avio_wl32(pb, comment_size);
     } else if (par->codec_id == AV_CODEC_ID_PCM_S32BE) {
         ffio_wfourcc(pb, "XoS.");
         avio_wb32(pb, sox->header_size);
         avio_wb64(pb, 0); /* number of samples */
         avio_wb64(pb, av_double2int(par->sample_rate));
-        avio_wb32(pb, par->channels);
+        avio_wb32(pb, par->ch_layout.nb_channels);
         avio_wb32(pb, comment_size);
     } else {
         av_log(s, AV_LOG_ERROR, "invalid codec; use pcm_s32le or pcm_s32be\n");
@@ -79,8 +80,6 @@ static int sox_write_header(AVFormatContext *s)
         avio_write(pb, comment->value, comment_len);
 
     ffio_fill(pb, 0, comment_size - comment_len);
-
-    avio_flush(pb);
 
     return 0;
 }
@@ -101,22 +100,20 @@ static int sox_write_trailer(AVFormatContext *s)
         } else
             avio_wb64(pb, num_samples);
         avio_seek(pb, file_size, SEEK_SET);
-
-        avio_flush(pb);
     }
 
     return 0;
 }
 
-AVOutputFormat ff_sox_muxer = {
-    .name              = "sox",
-    .long_name         = NULL_IF_CONFIG_SMALL("SoX native"),
-    .extensions        = "sox",
+const FFOutputFormat ff_sox_muxer = {
+    .p.name            = "sox",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("SoX (Sound eXchange) native"),
+    .p.extensions      = "sox",
     .priv_data_size    = sizeof(SoXContext),
-    .audio_codec       = AV_CODEC_ID_PCM_S32LE,
-    .video_codec       = AV_CODEC_ID_NONE,
+    .p.audio_codec     = AV_CODEC_ID_PCM_S32LE,
+    .p.video_codec     = AV_CODEC_ID_NONE,
     .write_header      = sox_write_header,
     .write_packet      = ff_raw_write_packet,
     .write_trailer     = sox_write_trailer,
-    .flags             = AVFMT_NOTIMESTAMPS,
+    .p.flags           = AVFMT_NOTIMESTAMPS,
 };

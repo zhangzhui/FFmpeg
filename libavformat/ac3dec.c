@@ -19,13 +19,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/avassert.h"
 #include "libavutil/crc.h"
 #include "libavcodec/ac3_parser.h"
 #include "avformat.h"
 #include "rawdec.h"
 
-static int ac3_eac3_probe(AVProbeData *p, enum AVCodecID expected_codec_id)
+static int ac3_eac3_probe(const AVProbeData *p, enum AVCodecID expected_codec_id)
 {
     int max_frames, first_frames = 0, frames;
     const uint8_t *buf, *buf2, *end;
@@ -97,12 +99,12 @@ static int ac3_eac3_probe(AVProbeData *p, enum AVCodecID expected_codec_id)
 }
 
 #if CONFIG_AC3_DEMUXER
-static int ac3_probe(AVProbeData *p)
+static int ac3_probe(const AVProbeData *p)
 {
     return ac3_eac3_probe(p, AV_CODEC_ID_AC3);
 }
 
-AVInputFormat ff_ac3_demuxer = {
+const AVInputFormat ff_ac3_demuxer = {
     .name           = "ac3",
     .long_name      = NULL_IF_CONFIG_SMALL("raw AC-3"),
     .read_probe     = ac3_probe,
@@ -111,23 +113,27 @@ AVInputFormat ff_ac3_demuxer = {
     .flags= AVFMT_GENERIC_INDEX,
     .extensions = "ac3",
     .raw_codec_id   = AV_CODEC_ID_AC3,
+    .priv_data_size = sizeof(FFRawDemuxerContext),
+    .priv_class     = &ff_raw_demuxer_class,
 };
 #endif
 
 #if CONFIG_EAC3_DEMUXER
-static int eac3_probe(AVProbeData *p)
+static int eac3_probe(const AVProbeData *p)
 {
     return ac3_eac3_probe(p, AV_CODEC_ID_EAC3);
 }
 
-AVInputFormat ff_eac3_demuxer = {
+const AVInputFormat ff_eac3_demuxer = {
     .name           = "eac3",
     .long_name      = NULL_IF_CONFIG_SMALL("raw E-AC-3"),
     .read_probe     = eac3_probe,
     .read_header    = ff_raw_audio_read_header,
     .read_packet    = ff_raw_read_partial_packet,
     .flags          = AVFMT_GENERIC_INDEX,
-    .extensions     = "eac3",
+    .extensions     = "eac3,ec3",
     .raw_codec_id   = AV_CODEC_ID_EAC3,
+    .priv_data_size = sizeof(FFRawDemuxerContext),
+    .priv_class     = &ff_raw_demuxer_class,
 };
 #endif

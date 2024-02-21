@@ -26,8 +26,13 @@
 
 #include <stdint.h>
 
+#include "mathops.h"
 #include "opus.h"
+#include "opus_rc.h"
+#include "opus_silk.h"
 #include "opustab.h"
+
+#define ROUND_MULL(a,b,s) (((MUL64(a, b) >> ((s) - 1)) + 1) >> 1)
 
 typedef struct SilkFrame {
     int coded;
@@ -43,7 +48,7 @@ typedef struct SilkFrame {
 } SilkFrame;
 
 struct SilkContext {
-    AVCodecContext *avctx;
+    void *logctx;
     int output_channels;
 
     int midonly;
@@ -198,7 +203,8 @@ static inline int silk_is_lpc_stable(const int16_t lpc[16], int order)
     }
 }
 
-static void silk_lsp2poly(const int32_t lsp[16], int32_t pol[16], int half_order)
+static void silk_lsp2poly(const int32_t lsp[/* 2 * half_order - 1 */],
+                          int32_t pol[/* half_order + 1 */], int half_order)
 {
     int i, j;
 
@@ -506,7 +512,8 @@ static inline void silk_decode_excitation(SilkContext *s, OpusRangeCoder *rc,
 #define LTP_ORDER 5
 
 static void silk_decode_frame(SilkContext *s, OpusRangeCoder *rc,
-                              int frame_num, int channel, int coded_channels, int active, int active1)
+                              int frame_num, int channel, int coded_channels,
+                              int active, int active1, int redundant)
 {
     /* per frame */
     int voiced;       // combines with active to indicate inactive, active, or active+voiced
@@ -665,8 +672,9 @@ static void silk_decode_frame(SilkContext *s, OpusRangeCoder *rc,
     silk_decode_excitation(s, rc, residual + SILK_MAX_LAG, qoffset_high,
                            active, voiced);
 
-    /* skip synthesising the side channel if we want mono-only */
-    if (s->output_channels == channel)
+    /* skip synthesising the output if we do not need it */
+    // TODO: implement error recovery
+    if (s->output_channels == channel || redundant)
         return;
 
     /* generate the output signal */
@@ -791,7 +799,7 @@ int ff_silk_decode_superframe(SilkContext *s, OpusRangeCoder *rc,
 
     if (bandwidth > OPUS_BANDWIDTH_WIDEBAND ||
         coded_channels > 2 || duration_ms > 60) {
-        av_log(s->avctx, AV_LOG_ERROR, "Invalid parameters passed "
+        av_log(s->logctx, AV_LOG_ERROR, "Invalid parameters passed "
                "to the SILK decoder.\n");
         return AVERROR(EINVAL);
     }
@@ -814,15 +822,29 @@ int ff_silk_decode_superframe(SilkContext *s, OpusRangeCoder *rc,
             active[i][j] = ff_opus_rc_dec_log(rc, 1);
 
         redundancy[i] = ff_opus_rc_dec_log(rc, 1);
-        if (redundancy[i]) {
-            avpriv_report_missing_feature(s->avctx, "LBRR frames");
-            return AVERROR_PATCHWELCOME;
+    }
+
+    /* read the per-frame LBRR flags */
+    for (i = 0; i < coded_channels; i++)
+        if (redundancy[i] && duration_ms > 20) {
+            redundancy[i] = ff_opus_rc_dec_cdf(rc, duration_ms == 40 ?
+                                                   ff_silk_model_lbrr_flags_40 : ff_silk_model_lbrr_flags_60);
         }
+
+    /* decode the LBRR frames */
+    for (i = 0; i < nb_frames; i++) {
+        for (j = 0; j < coded_channels; j++)
+            if (redundancy[j] & (1 << i)) {
+                int active1 = (j == 0 && !(redundancy[1] & (1 << i))) ? 0 : 1;
+                silk_decode_frame(s, rc, i, j, coded_channels, 1, active1, 1);
+            }
+
+        s->midonly = 0;
     }
 
     for (i = 0; i < nb_frames; i++) {
         for (j = 0; j < coded_channels && !s->midonly; j++)
-            silk_decode_frame(s, rc, i, j, coded_channels, active[j][i], active[1][i]);
+            silk_decode_frame(s, rc, i, j, coded_channels, active[j][i], active[1][i], 0);
 
         /* reset the side channel if it is not coded */
         if (s->midonly && s->frame[1].coded)
@@ -857,12 +879,12 @@ void ff_silk_flush(SilkContext *s)
     memset(s->prev_stereo_weights, 0, sizeof(s->prev_stereo_weights));
 }
 
-int ff_silk_init(AVCodecContext *avctx, SilkContext **ps, int output_channels)
+int ff_silk_init(void *logctx, SilkContext **ps, int output_channels)
 {
     SilkContext *s;
 
     if (output_channels != 1 && output_channels != 2) {
-        av_log(avctx, AV_LOG_ERROR, "Invalid number of output channels: %d\n",
+        av_log(logctx, AV_LOG_ERROR, "Invalid number of output channels: %d\n",
                output_channels);
         return AVERROR(EINVAL);
     }
@@ -871,7 +893,7 @@ int ff_silk_init(AVCodecContext *avctx, SilkContext **ps, int output_channels)
     if (!s)
         return AVERROR(ENOMEM);
 
-    s->avctx           = avctx;
+    s->logctx          = logctx;
     s->output_channels = output_channels;
 
     ff_silk_flush(s);

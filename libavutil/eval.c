@@ -35,6 +35,7 @@
 #include "internal.h"
 #include "log.h"
 #include "mathematics.h"
+#include "sfc64.h"
 #include "time.h"
 #include "avstring.h"
 #include "timer.h"
@@ -55,6 +56,7 @@ typedef struct Parser {
     void *log_ctx;
 #define VARS 10
     double *var;
+    FFSFC64 *prng_state;
 } Parser;
 
 static const AVClass eval_class = {
@@ -163,16 +165,18 @@ struct AVExpr {
         e_last, e_st, e_while, e_taylor, e_root, e_floor, e_ceil, e_trunc, e_round,
         e_sqrt, e_not, e_random, e_hypot, e_gcd,
         e_if, e_ifnot, e_print, e_bitand, e_bitor, e_between, e_clip, e_atan2, e_lerp,
+        e_sgn, e_randomi
     } type;
     double value; // is sign in other types
+    int const_index;
     union {
-        int const_index;
         double (*func0)(double);
         double (*func1)(void *, double);
         double (*func2)(void *, double, double);
     } a;
     struct AVExpr *param[3];
     double *var;
+    FFSFC64 *prng_state;
 };
 
 static double etime(double v)
@@ -184,7 +188,7 @@ static double eval_expr(Parser *p, AVExpr *e)
 {
     switch (e->type) {
         case e_value:  return e->value;
-        case e_const:  return e->value * p->const_values[e->a.const_index];
+        case e_const:  return e->value * p->const_values[e->const_index];
         case e_func0:  return e->value * e->a.func0(eval_expr(p, e->param[0]));
         case e_func1:  return e->value * e->a.func1(p->opaque, eval_expr(p, e->param[0]));
         case e_func2:  return e->value * e->a.func2(p->opaque, eval_expr(p, e->param[0]), eval_expr(p, e->param[1]));
@@ -197,6 +201,7 @@ static double eval_expr(Parser *p, AVExpr *e)
         case e_ceil :  return e->value * ceil (eval_expr(p, e->param[0]));
         case e_trunc:  return e->value * trunc(eval_expr(p, e->param[0]));
         case e_round:  return e->value * round(eval_expr(p, e->param[0]));
+        case e_sgn:    return e->value * FFDIFFSIGN(eval_expr(p, e->param[0]), 0);
         case e_sqrt:   return e->value * sqrt (eval_expr(p, e->param[0]));
         case e_not:    return e->value * (eval_expr(p, e->param[0]) == 0);
         case e_if:     return e->value * (eval_expr(p, e->param[0]) ? eval_expr(p, e->param[1]) :
@@ -227,12 +232,28 @@ static double eval_expr(Parser *p, AVExpr *e)
             av_log(p, level, "%f\n", x);
             return x;
         }
-        case e_random:{
-            int idx= av_clip(eval_expr(p, e->param[0]), 0, VARS-1);
-            uint64_t r= isnan(p->var[idx]) ? 0 : p->var[idx];
-            r= r*1664525+1013904223;
-            p->var[idx]= r;
-            return e->value * (r * (1.0/UINT64_MAX));
+
+#define COMPUTE_NEXT_RANDOM()                                        \
+            int idx = av_clip(eval_expr(p, e->param[0]), 0, VARS-1); \
+            FFSFC64 *s = p->prng_state + idx;                        \
+            uint64_t r;                                              \
+                                                                     \
+            if (!s->counter) {                                       \
+                r = isnan(p->var[idx]) ? 0 : p->var[idx];            \
+                ff_sfc64_init(s, r, r, r, 12);                       \
+            }                                                        \
+            r = ff_sfc64_get(s);                                     \
+            p->var[idx] = r;                                         \
+
+        case e_random: {
+            COMPUTE_NEXT_RANDOM();
+            return r * (1.0/UINT64_MAX);
+        }
+        case e_randomi: {
+            double min = eval_expr(p, e->param[1]);
+            double max = eval_expr(p, e->param[2]);
+            COMPUTE_NEXT_RANDOM();
+            return min + (max - min) * r / UINT64_MAX;
         }
         case e_while: {
             double d = NAN;
@@ -304,7 +325,7 @@ static double eval_expr(Parser *p, AVExpr *e)
             double d = eval_expr(p, e->param[0]);
             double d2 = eval_expr(p, e->param[1]);
             switch (e->type) {
-                case e_mod: return e->value * (d - floor((!CONFIG_FTRAPV || d2) ? d / d2 : d * INFINITY) * d2);
+                case e_mod: return e->value * (d - floor(d2 ? d / d2 : d * INFINITY) * d2);
                 case e_gcd: return e->value * av_gcd(d,d2);
                 case e_max: return e->value * (d >  d2 ?   d : d2);
                 case e_min: return e->value * (d <  d2 ?   d : d2);
@@ -315,10 +336,14 @@ static double eval_expr(Parser *p, AVExpr *e)
                 case e_lte: return e->value * (d <= d2 ? 1.0 : 0.0);
                 case e_pow: return e->value * pow(d, d2);
                 case e_mul: return e->value * (d * d2);
-                case e_div: return e->value * ((!CONFIG_FTRAPV || d2 ) ? (d / d2) : d * INFINITY);
+                case e_div: return e->value * (d2 ? (d / d2) : d * INFINITY);
                 case e_add: return e->value * (d + d2);
                 case e_last:return e->value * d2;
-                case e_st : return e->value * (p->var[av_clip(d, 0, VARS-1)]= d2);
+                case e_st :  {
+                    int index = av_clip(d, 0, VARS-1);
+                    p->prng_state[index].counter = 0;
+                    return e->value * (p->var[index]= d2);
+                }
                 case e_hypot:return e->value * hypot(d, d2);
                 case e_atan2:return e->value * atan2(d, d2);
                 case e_bitand: return isnan(d) || isnan(d2) ? NAN : e->value * ((long int)d & (long int)d2);
@@ -338,6 +363,7 @@ void av_expr_free(AVExpr *e)
     av_expr_free(e->param[1]);
     av_expr_free(e->param[2]);
     av_freep(&e->var);
+    av_freep(&e->prng_state);
     av_freep(&e);
 }
 
@@ -365,7 +391,7 @@ static int parse_primary(AVExpr **e, Parser *p)
         if (strmatch(p->s, p->const_names[i])) {
             p->s+= strlen(p->const_names[i]);
             d->type = e_const;
-            d->a.const_index = i;
+            d->const_index = i;
             *e = d;
             return 0;
         }
@@ -460,6 +486,7 @@ static int parse_primary(AVExpr **e, Parser *p)
     else if (strmatch(next, "pow"   )) d->type = e_pow;
     else if (strmatch(next, "print" )) d->type = e_print;
     else if (strmatch(next, "random")) d->type = e_random;
+    else if (strmatch(next, "randomi")) d->type = e_randomi;
     else if (strmatch(next, "hypot" )) d->type = e_hypot;
     else if (strmatch(next, "gcd"   )) d->type = e_gcd;
     else if (strmatch(next, "if"    )) d->type = e_if;
@@ -470,11 +497,13 @@ static int parse_primary(AVExpr **e, Parser *p)
     else if (strmatch(next, "clip"  )) d->type = e_clip;
     else if (strmatch(next, "atan2" )) d->type = e_atan2;
     else if (strmatch(next, "lerp"  )) d->type = e_lerp;
+    else if (strmatch(next, "sgn"   )) d->type = e_sgn;
     else {
         for (i=0; p->func1_names && p->func1_names[i]; i++) {
             if (strmatch(next, p->func1_names[i])) {
                 d->a.func1 = p->funcs1[i];
                 d->type = e_func1;
+                d->const_index = i;
                 *e = d;
                 return 0;
             }
@@ -484,6 +513,7 @@ static int parse_primary(AVExpr **e, Parser *p)
             if (strmatch(next, p->func2_names[i])) {
                 d->a.func2 = p->funcs2[i];
                 d->type = e_func2;
+                d->const_index = i;
                 *e = d;
                 return 0;
             }
@@ -657,6 +687,7 @@ static int verify_expr(AVExpr *e)
         case e_sqrt:
         case e_not:
         case e_random:
+        case e_sgn:
             return verify_expr(e->param[0]) && !e->param[1];
         case e_print:
             return verify_expr(e->param[0])
@@ -669,6 +700,7 @@ static int verify_expr(AVExpr *e)
         case e_between:
         case e_clip:
         case e_lerp:
+        case e_randomi:
             return verify_expr(e->param[0]) &&
                    verify_expr(e->param[1]) &&
                    verify_expr(e->param[2]);
@@ -719,7 +751,8 @@ int av_expr_parse(AVExpr **expr, const char *s,
         goto end;
     }
     e->var= av_mallocz(sizeof(double) *VARS);
-    if (!e->var) {
+    e->prng_state = av_mallocz(sizeof(*e->prng_state) *VARS);
+    if (!e->var || !e->prng_state) {
         ret = AVERROR(ENOMEM);
         goto end;
     }
@@ -731,10 +764,37 @@ end:
     return ret;
 }
 
+static int expr_count(AVExpr *e, unsigned *counter, int size, int type)
+{
+    int i;
+
+    if (!e || !counter || !size)
+        return AVERROR(EINVAL);
+
+    for (i = 0; e->type != type && i < 3 && e->param[i]; i++)
+        expr_count(e->param[i], counter, size, type);
+
+    if (e->type == type && e->const_index < size)
+        counter[e->const_index]++;
+
+    return 0;
+}
+
+int av_expr_count_vars(AVExpr *e, unsigned *counter, int size)
+{
+    return expr_count(e, counter, size, e_const);
+}
+
+int av_expr_count_func(AVExpr *e, unsigned *counter, int size, int arg)
+{
+    return expr_count(e, counter, size, ((int[]){e_const, e_func1, e_func2})[arg]);
+}
+
 double av_expr_eval(AVExpr *e, const double *const_values, void *opaque)
 {
     Parser p = { 0 };
     p.var= e->var;
+    p.prng_state= e->prng_state;
 
     p.const_values = const_values;
     p.opaque     = opaque;

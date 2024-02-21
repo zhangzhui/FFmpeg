@@ -20,6 +20,7 @@
  */
 
 #include "avformat.h"
+#include "mux.h"
 #include "rawenc.h"
 
 
@@ -55,17 +56,16 @@ static int roq_write_header(struct AVFormatContext *s)
     }
 
     avio_write(s->pb, header, 8);
-    avio_flush(s->pb);
 
     return 0;
 }
 
-AVOutputFormat ff_roq_muxer = {
-    .name         = "roq",
-    .long_name    = NULL_IF_CONFIG_SMALL("raw id RoQ"),
-    .extensions   = "roq",
-    .audio_codec  = AV_CODEC_ID_ROQ_DPCM,
-    .video_codec  = AV_CODEC_ID_ROQ,
+const FFOutputFormat ff_roq_muxer = {
+    .p.name        = "roq",
+    .p.long_name   = NULL_IF_CONFIG_SMALL("raw id RoQ"),
+    .p.extensions  = "roq",
+    .p.audio_codec = AV_CODEC_ID_ROQ_DPCM,
+    .p.video_codec = AV_CODEC_ID_ROQ,
     .write_header = roq_write_header,
     .write_packet = ff_raw_write_packet,
 };

@@ -31,7 +31,8 @@
  */
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include <float.h>
 #include "libavutil/intreadwrite.h"
 #include "libavutil/intfloat.h"
@@ -63,7 +64,7 @@ static int fill_data_min_max(const uint8_t *ptr8, FITSHeader *header, const uint
     int i, j;
 
     header->data_min = DBL_MAX;
-    header->data_max = DBL_MIN;
+    header->data_max = -DBL_MAX;
     switch (header->bitpix) {
 #define CASE_N(a, t, rd) \
     case a: \
@@ -143,7 +144,7 @@ static int fits_read_header(AVCodecContext *avctx, const uint8_t **ptr, FITSHead
 
     size = abs(header->bitpix) >> 3;
     for (i = 0; i < header->naxis; i++) {
-        if (header->naxisn[i] > SIZE_MAX / size) {
+        if (size == 0 || header->naxisn[i] > SIZE_MAX / size) {
             av_log(avctx, AV_LOG_ERROR, "unsupported size of FITS image");
             return AVERROR_INVALIDDATA;
         }
@@ -168,13 +169,21 @@ static int fits_read_header(AVCodecContext *avctx, const uint8_t **ptr, FITSHead
         header->data_min = (header->data_min - header->bzero) / header->bscale;
         header->data_max = (header->data_max - header->bzero) / header->bscale;
     }
+    if (!header->rgb && header->data_min >= header->data_max) {
+        if (header->data_min > header->data_max) {
+            av_log(avctx, AV_LOG_ERROR, "data min/max (%g %g) is invalid\n", header->data_min, header->data_max);
+            return AVERROR_INVALIDDATA;
+        }
+        av_log(avctx, AV_LOG_WARNING, "data min/max indicates a blank image\n");
+        header->data_max ++;
+    }
 
     return 0;
 }
 
-static int fits_decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPacket *avpkt)
+static int fits_decode_frame(AVCodecContext *avctx, AVFrame *p,
+                             int *got_frame, AVPacket *avpkt)
 {
-    AVFrame *p=data;
     const uint8_t *ptr8 = avpkt->data, *end;
     uint8_t t8;
     int16_t t16;
@@ -256,6 +265,13 @@ static int fits_decode_frame(AVCodecContext *avctx, void *data, int *got_frame, 
             CASE_RGB(16, dst16, uint16_t, AV_RB16);
         }
     } else {
+        double scale = header.data_max - header.data_min;
+
+        if (scale <= 0 || !isfinite(scale)) {
+            scale = 1;
+        }
+        scale = 1/scale;
+
         switch (header.bitpix) {
 #define CASE_GRAY(cas, dst, type, t, rd) \
     case cas: \
@@ -264,7 +280,7 @@ static int fits_decode_frame(AVCodecContext *avctx, void *data, int *got_frame, 
             for (j = 0; j < avctx->width; j++) { \
                 t = rd; \
                 if (!header.blank_found || t != header.blank) { \
-                    *dst++ = ((t - header.data_min) * ((1 << (sizeof(type) * 8)) - 1)) / (header.data_max - header.data_min); \
+                    *dst++ = lrint(((t - header.data_min) * ((1 << (sizeof(type) * 8)) - 1)) * scale); \
                 } else { \
                     *dst++ = fitsctx->blank_val; \
                 } \
@@ -285,7 +301,7 @@ static int fits_decode_frame(AVCodecContext *avctx, void *data, int *got_frame, 
         }
     }
 
-    p->key_frame = 1;
+    p->flags |= AV_FRAME_FLAG_KEY;
     p->pict_type = AV_PICTURE_TYPE_I;
 
     *got_frame = 1;
@@ -303,15 +319,16 @@ static const AVClass fits_decoder_class = {
     .item_name  = av_default_item_name,
     .option     = fits_options,
     .version    = LIBAVUTIL_VERSION_INT,
+    .category   = AV_CLASS_CATEGORY_DECODER,
 };
 
-AVCodec ff_fits_decoder = {
-    .name           = "fits",
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_FITS,
+const FFCodec ff_fits_decoder = {
+    .p.name         = "fits",
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_FITS,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    CODEC_LONG_NAME("Flexible Image Transport System"),
+    .p.priv_class   = &fits_decoder_class,
     .priv_data_size = sizeof(FITSContext),
-    .decode         = fits_decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("Flexible Image Transport System"),
-    .priv_class     = &fits_decoder_class
+    FF_CODEC_DECODE_CB(fits_decode_frame),
 };

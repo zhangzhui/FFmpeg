@@ -26,6 +26,7 @@
 #include "libavutil/parseutils.h"
 #include "libavutil/xga_font_data.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
 #include "audio.h"
 #include "video.h"
@@ -47,6 +48,7 @@ typedef struct ShowVolumeContext {
     float bgopacity;
     int mode;
 
+    int nb_samples;
     AVFrame *out;
     AVExpr *c_expr;
     int draw_text;
@@ -54,7 +56,6 @@ typedef struct ShowVolumeContext {
     double *values;
     uint32_t *color_lut;
     float *max;
-    float rms_factor;
     int display_scale;
 
     double draw_persistent_duration; /* in second */
@@ -63,7 +64,7 @@ typedef struct ShowVolumeContext {
     float *max_persistent; /* max value for draw_persistent_max for each channel */
     int *nb_frames_max_display; /* number of frame for each channel, for displaying the max value */
 
-    void (*meter)(float *src, int nb_samples, float *max, float factor);
+    void (*meter)(float *src, int nb_samples, float *max);
 } ShowVolumeContext;
 
 #define OFFSET(x) offsetof(ShowVolumeContext, x)
@@ -80,18 +81,18 @@ static const AVOption showvolume_options[] = {
     { "t", "display channel names", OFFSET(draw_text), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, FLAGS },
     { "v", "display volume value", OFFSET(draw_volume), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, FLAGS },
     { "dm", "duration for max value display", OFFSET(draw_persistent_duration), AV_OPT_TYPE_DOUBLE, {.dbl=0.}, 0, 9000, FLAGS},
-    { "dmc","set color of the max value line", OFFSET(persistant_max_rgba), AV_OPT_TYPE_COLOR, {.str = "orange"}, CHAR_MIN, CHAR_MAX, FLAGS },
-    { "o", "set orientation", OFFSET(orientation), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, "orientation" },
-    {   "h", "horizontal", 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "orientation" },
-    {   "v", "vertical",   0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "orientation" },
+    { "dmc","set color of the max value line", OFFSET(persistant_max_rgba), AV_OPT_TYPE_COLOR, {.str = "orange"}, 0, 0, FLAGS },
+    { "o", "set orientation", OFFSET(orientation), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, .unit = "orientation" },
+    {   "h", "horizontal", 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, .unit = "orientation" },
+    {   "v", "vertical",   0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, .unit = "orientation" },
     { "s", "set step size", OFFSET(step), AV_OPT_TYPE_INT, {.i64=0}, 0, 5, FLAGS },
     { "p", "set background opacity", OFFSET(bgopacity), AV_OPT_TYPE_FLOAT, {.dbl=0}, 0, 1, FLAGS },
-    { "m", "set mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, "mode" },
-    {   "p", "peak", 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "mode" },
-    {   "r", "rms",  0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "mode" },
-    { "ds", "set display scale", OFFSET(display_scale), AV_OPT_TYPE_INT, {.i64=LINEAR}, LINEAR, NB_DISPLAY_SCALE - 1, FLAGS, "display_scale" },
-    {   "lin", "linear", 0, AV_OPT_TYPE_CONST, {.i64=LINEAR}, 0, 0, FLAGS, "display_scale" },
-    {   "log", "log",  0, AV_OPT_TYPE_CONST, {.i64=LOG}, 0, 0, FLAGS, "display_scale" },
+    { "m", "set mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, .unit = "mode" },
+    {   "p", "peak", 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, .unit = "mode" },
+    {   "r", "rms",  0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, .unit = "mode" },
+    { "ds", "set display scale", OFFSET(display_scale), AV_OPT_TYPE_INT, {.i64=LINEAR}, LINEAR, NB_DISPLAY_SCALE - 1, FLAGS, .unit = "display_scale" },
+    {   "lin", "linear", 0, AV_OPT_TYPE_CONST, {.i64=LINEAR}, 0, 0, FLAGS, .unit = "display_scale" },
+    {   "log", "log",  0, AV_OPT_TYPE_CONST, {.i64=LOG}, 0, 0, FLAGS, .unit = "display_scale" },
     { NULL }
 };
 
@@ -123,64 +124,60 @@ static int query_formats(AVFilterContext *ctx)
     int ret;
 
     formats = ff_make_format_list(sample_fmts);
-    if ((ret = ff_formats_ref(formats, &inlink->out_formats)) < 0)
+    if ((ret = ff_formats_ref(formats, &inlink->outcfg.formats)) < 0)
         return ret;
 
     layouts = ff_all_channel_counts();
-    if ((ret = ff_channel_layouts_ref(layouts, &inlink->out_channel_layouts)) < 0)
+    if ((ret = ff_channel_layouts_ref(layouts, &inlink->outcfg.channel_layouts)) < 0)
         return ret;
 
     formats = ff_all_samplerates();
-    if ((ret = ff_formats_ref(formats, &inlink->out_samplerates)) < 0)
+    if ((ret = ff_formats_ref(formats, &inlink->outcfg.samplerates)) < 0)
         return ret;
 
     formats = ff_make_format_list(pix_fmts);
-    if ((ret = ff_formats_ref(formats, &outlink->in_formats)) < 0)
+    if ((ret = ff_formats_ref(formats, &outlink->incfg.formats)) < 0)
         return ret;
 
     return 0;
 }
 
-static void find_peak(float *src, int nb_samples, float *peak, float factor)
+static void find_peak(float *src, int nb_samples, float *peak)
 {
-    int i;
+    float max = 0.f;
 
-    *peak = 0;
-    for (i = 0; i < nb_samples; i++)
-        *peak = FFMAX(*peak, FFABS(src[i]));
+    max = 0;
+    for (int i = 0; i < nb_samples; i++)
+        max = fmaxf(max, fabsf(src[i]));
+    *peak = max;
 }
 
-static void find_rms(float *src, int nb_samples, float *rms, float factor)
+static void find_rms(float *src, int nb_samples, float *rms)
 {
-    int i;
+    float sum = 0.f;
 
-    for (i = 0; i < nb_samples; i++)
-        *rms += factor * (src[i] * src[i] - *rms);
+    for (int i = 0; i < nb_samples; i++)
+        sum += src[i] * src[i];
+    *rms = sqrtf(sum / nb_samples);
 }
 
 static int config_input(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
     ShowVolumeContext *s = ctx->priv;
-    int nb_samples;
 
-    nb_samples = FFMAX(1024, ((double)inlink->sample_rate / av_q2d(s->frame_rate)) + 0.5);
-    inlink->partial_buf_size =
-    inlink->min_samples =
-    inlink->max_samples = nb_samples;
-    s->values = av_calloc(inlink->channels * VAR_VARS_NB, sizeof(double));
+    s->nb_samples = FFMAX(1, av_rescale(inlink->sample_rate, s->frame_rate.den, s->frame_rate.num));
+    s->values = av_calloc(inlink->ch_layout.nb_channels * VAR_VARS_NB, sizeof(double));
     if (!s->values)
         return AVERROR(ENOMEM);
 
-    s->color_lut = av_calloc(s->w, sizeof(*s->color_lut) * inlink->channels);
+    s->color_lut = av_calloc(s->w, sizeof(*s->color_lut) * inlink->ch_layout.nb_channels);
     if (!s->color_lut)
         return AVERROR(ENOMEM);
 
-    s->max = av_calloc(inlink->channels, sizeof(*s->max));
+    s->max = av_calloc(inlink->ch_layout.nb_channels, sizeof(*s->max));
     if (!s->max)
         return AVERROR(ENOMEM);
-
-    s->rms_factor = 10000. / inlink->sample_rate;
 
     switch (s->mode) {
     case 0: s->meter = find_peak; break;
@@ -190,8 +187,11 @@ static int config_input(AVFilterLink *inlink)
 
     if (s->draw_persistent_duration > 0.) {
         s->persistent_max_frames = (int) FFMAX(av_q2d(s->frame_rate) * s->draw_persistent_duration, 1.);
-        s->max_persistent = av_calloc(inlink->channels * s->persistent_max_frames, sizeof(*s->max_persistent));
-        s->nb_frames_max_display = av_calloc(inlink->channels * s->persistent_max_frames, sizeof(*s->nb_frames_max_display));
+        s->max_persistent = av_calloc(inlink->ch_layout.nb_channels * s->persistent_max_frames, sizeof(*s->max_persistent));
+        s->nb_frames_max_display = av_calloc(inlink->ch_layout.nb_channels * s->persistent_max_frames, sizeof(*s->nb_frames_max_display));
+        if (!s->max_persistent ||
+            !s->nb_frames_max_display)
+            return AVERROR(ENOMEM);
     }
     return 0;
 }
@@ -204,16 +204,17 @@ static int config_output(AVFilterLink *outlink)
 
     if (s->orientation) {
         outlink->h = s->w;
-        outlink->w = s->h * inlink->channels + (inlink->channels - 1) * s->b;
+        outlink->w = s->h * inlink->ch_layout.nb_channels + (inlink->ch_layout.nb_channels - 1) * s->b;
     } else {
         outlink->w = s->w;
-        outlink->h = s->h * inlink->channels + (inlink->channels - 1) * s->b;
+        outlink->h = s->h * inlink->ch_layout.nb_channels + (inlink->ch_layout.nb_channels - 1) * s->b;
     }
 
     outlink->sample_aspect_ratio = (AVRational){1,1};
     outlink->frame_rate = s->frame_rate;
+    outlink->time_base = av_inv_q(outlink->frame_rate);
 
-    for (ch = 0; ch < inlink->channels; ch++) {
+    for (ch = 0; ch < inlink->ch_layout.nb_channels; ch++) {
         int i;
 
         for (i = 0; i < s->w; i++) {
@@ -323,7 +324,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
     AVFilterLink *outlink = ctx->outputs[0];
     ShowVolumeContext *s = ctx->priv;
     const int step = s->step;
-    int c, j, k, max_draw;
+    int c, j, k, max_draw, ret;
+    char channel_name[64];
     AVFrame *out;
 
     if (!s->out || s->out->width  != outlink->w ||
@@ -336,7 +338,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
         }
         clear_picture(s, outlink);
     }
-    s->out->pts = insamples->pts;
+    s->out->pts = av_rescale_q(insamples->pts, inlink->time_base, outlink->time_base);
+    s->out->duration = 1;
 
     if ((s->f < 1.) && (s->f > 0.)) {
         for (j = 0; j < outlink->h; j++) {
@@ -355,32 +358,25 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
     }
 
     if (s->orientation) { /* vertical */
-        for (c = 0; c < inlink->channels; c++) {
+        for (c = 0; c < inlink->ch_layout.nb_channels; c++) {
             float *src = (float *)insamples->extended_data[c];
             uint32_t *lut = s->color_lut + s->w * c;
             float max;
 
-            s->meter(src, insamples->nb_samples, &s->max[c], s->rms_factor);
+            s->meter(src, insamples->nb_samples, &s->max[c]);
             max = s->max[c];
 
             s->values[c * VAR_VARS_NB + VAR_VOLUME] = 20.0 * log10(max);
             max = av_clipf(max, 0, 1);
             max_draw = calc_max_draw(s, outlink, max);
 
-            for (j = max_draw; j < s->w; j++) {
+            for (j = s->w - 1; j >= max_draw; j--) {
                 uint8_t *dst = s->out->data[0] + j * s->out->linesize[0] + c * (s->b + s->h) * 4;
                 for (k = 0; k < s->h; k++) {
                     AV_WN32A(&dst[k * 4], lut[s->w - j - 1]);
-                    if (j & step)
-                        j += step;
                 }
-            }
-
-            if (s->h >= 8 && s->draw_text) {
-                const char *channel_name = av_get_channel_name(av_channel_layout_extract_channel(insamples->channel_layout, c));
-                if (!channel_name)
-                    continue;
-                drawtext(s->out, c * (s->h + s->b) + (s->h - 10) / 2, outlink->h - 35, channel_name, 1);
+                if (j & step)
+                    j -= step;
             }
 
             if (s->draw_persistent_duration > 0.) {
@@ -390,12 +386,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
             }
         }
     } else { /* horizontal */
-        for (c = 0; c < inlink->channels; c++) {
+        for (c = 0; c < inlink->ch_layout.nb_channels; c++) {
             float *src = (float *)insamples->extended_data[c];
             uint32_t *lut = s->color_lut + s->w * c;
             float max;
 
-            s->meter(src, insamples->nb_samples, &s->max[c], s->rms_factor);
+            s->meter(src, insamples->nb_samples, &s->max[c]);
             max = s->max[c];
 
             s->values[c * VAR_VARS_NB + VAR_VOLUME] = 20.0 * log10(max);
@@ -412,13 +408,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
                 }
             }
 
-            if (s->h >= 8 && s->draw_text) {
-                const char *channel_name = av_get_channel_name(av_channel_layout_extract_channel(insamples->channel_layout, c));
-                if (!channel_name)
-                    continue;
-                drawtext(s->out, 2, c * (s->h + s->b) + (s->h - 8) / 2, channel_name, 0);
-            }
-
             if (s->draw_persistent_duration > 0.) {
                 calc_persistent_max(s, max, c);
                 max_draw = FFMAX(0, calc_max_draw(s, outlink, s->max_persistent[c]) - 1);
@@ -431,10 +420,29 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
     out = av_frame_clone(s->out);
     if (!out)
         return AVERROR(ENOMEM);
-    av_frame_make_writable(out);
+    ret = ff_inlink_make_frame_writable(outlink, &out);
+    if (ret < 0) {
+        av_frame_free(&out);
+        return ret;
+    }
+
+    /* draw channel names */
+    for (c = 0; c < inlink->ch_layout.nb_channels && s->h >= 10 && s->draw_text; c++) {
+        if (s->orientation) { /* vertical */
+            int ret = av_channel_name(channel_name, sizeof(channel_name), av_channel_layout_channel_from_index(&inlink->ch_layout, c));
+            if (ret < 0)
+                continue;
+            drawtext(out, c * (s->h + s->b) + (s->h - 10) / 2, outlink->h - 35, channel_name, 1);
+        } else { /* horizontal */
+            int ret = av_channel_name(channel_name, sizeof(channel_name), av_channel_layout_channel_from_index(&inlink->ch_layout, c));
+            if (ret < 0)
+                continue;
+            drawtext(out, 2, c * (s->h + s->b) + (s->h - 8) / 2, channel_name, 0);
+        }
+    }
 
     /* draw volume level */
-    for (c = 0; c < inlink->channels && s->h >= 8 && s->draw_volume; c++) {
+    for (c = 0; c < inlink->ch_layout.nb_channels && s->h >= 8 && s->draw_volume; c++) {
         char buf[16];
 
         if (s->orientation) { /* vertical */
@@ -449,6 +457,33 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
     return ff_filter_frame(outlink, out);
 }
 
+static int activate(AVFilterContext *ctx)
+{
+    AVFilterLink *inlink = ctx->inputs[0];
+    AVFilterLink *outlink = ctx->outputs[0];
+    ShowVolumeContext *s = ctx->priv;
+    AVFrame *in = NULL;
+    int ret;
+
+    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
+
+    ret = ff_inlink_consume_samples(inlink, s->nb_samples, s->nb_samples, &in);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return filter_frame(inlink, in);
+
+    if (ff_inlink_queued_samples(inlink) >= s->nb_samples) {
+        ff_filter_set_ready(ctx, 10);
+        return 0;
+    }
+
+    FF_FILTER_FORWARD_STATUS(inlink, outlink);
+    FF_FILTER_FORWARD_WANTED(outlink, inlink);
+
+    return FFERROR_NOT_READY;
+}
+
 static av_cold void uninit(AVFilterContext *ctx)
 {
     ShowVolumeContext *s = ctx->priv;
@@ -458,6 +493,8 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_freep(&s->values);
     av_freep(&s->color_lut);
     av_freep(&s->max);
+    av_freep(&s->max_persistent);
+    av_freep(&s->nb_frames_max_display);
 }
 
 static const AVFilterPad showvolume_inputs[] = {
@@ -465,9 +502,7 @@ static const AVFilterPad showvolume_inputs[] = {
         .name         = "default",
         .type         = AVMEDIA_TYPE_AUDIO,
         .config_props = config_input,
-        .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad showvolume_outputs[] = {
@@ -476,17 +511,17 @@ static const AVFilterPad showvolume_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_avf_showvolume = {
+const AVFilter ff_avf_showvolume = {
     .name          = "showvolume",
     .description   = NULL_IF_CONFIG_SMALL("Convert input audio volume to video output."),
     .init          = init,
+    .activate      = activate,
     .uninit        = uninit,
-    .query_formats = query_formats,
     .priv_size     = sizeof(ShowVolumeContext),
-    .inputs        = showvolume_inputs,
-    .outputs       = showvolume_outputs,
+    FILTER_INPUTS(showvolume_inputs),
+    FILTER_OUTPUTS(showvolume_outputs),
+    FILTER_QUERY_FUNC(query_formats),
     .priv_class    = &showvolume_class,
 };

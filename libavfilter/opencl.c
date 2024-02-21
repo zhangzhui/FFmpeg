@@ -19,26 +19,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "libavutil/file_open.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 
-#include "formats.h"
 #include "opencl.h"
-
-int ff_opencl_filter_query_formats(AVFilterContext *avctx)
-{
-    const static enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_OPENCL,
-        AV_PIX_FMT_NONE,
-    };
-    AVFilterFormats *formats;
-
-    formats = ff_make_format_list(pix_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-
-    return ff_set_common_formats(avctx, formats);
-}
 
 static int opencl_filter_set_device(AVFilterContext *avctx,
                                     AVBufferRef *device)
@@ -225,7 +210,7 @@ int ff_opencl_filter_load_program_from_file(AVFilterContext *avctx,
     const char *src_const;
     int err;
 
-    file = fopen(filename, "r");
+    file = avpriv_fopen_utf8(filename, "r");
     if (!file) {
         av_log(avctx, AV_LOG_ERROR, "Unable to open program "
                "source file \"%s\".\n", filename);
@@ -257,7 +242,7 @@ int ff_opencl_filter_load_program_from_file(AVFilterContext *avctx,
             goto fail;
         }
         pos += rb;
-        if (pos < len)
+        if (pos + 1 < len)
             break;
         len <<= 1;
         err = av_reallocp(&src, len);
@@ -336,4 +321,27 @@ int ff_opencl_filter_work_size_from_image(AVFilterContext *avctx,
     work_size[1] = height;
 
     return 0;
+}
+
+void ff_opencl_print_const_matrix_3x3(AVBPrint *buf, const char *name_str,
+                                      double mat[3][3])
+{
+    int i, j;
+    av_bprintf(buf, "__constant float %s[9] = {\n", name_str);
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++)
+            av_bprintf(buf, " %.5ff,", mat[i][j]);
+        av_bprintf(buf, "\n");
+    }
+    av_bprintf(buf, "};\n");
+}
+
+cl_ulong ff_opencl_get_event_time(cl_event event) {
+    cl_ulong time_start;
+    cl_ulong time_end;
+
+    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+
+    return time_end - time_start;
 }

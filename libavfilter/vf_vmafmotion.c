@@ -24,12 +24,13 @@
  * Calculate VMAF Motion score.
  */
 
+#include "libavutil/file_open.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "drawutils.h"
 #include "formats.h"
 #include "internal.h"
+#include "video.h"
 #include "vmaf_motion.h"
 
 #define BIT_SHIFT 15
@@ -177,8 +178,8 @@ static void convolution_y_##bits##bit(const uint16_t *filter, int filt_w, \
     } \
 }
 
-conv_y_fn(uint8_t, 8);
-conv_y_fn(uint16_t, 10);
+conv_y_fn(uint8_t, 8)
+conv_y_fn(uint16_t, 10)
 
 static void vmafmotiondsp_init(VMAFMotionDSPContext *dsp, int bpp) {
     dsp->convolution_x = convolution_x;
@@ -238,6 +239,9 @@ int ff_vmafmotion_init(VMAFMotionData *s,
     size_t data_sz;
     int i;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
+
+    if (w < 3 || h < 3)
+        return AVERROR(EINVAL);
 
     s->width = w;
     s->height = h;
@@ -310,7 +314,7 @@ static av_cold int init(AVFilterContext *ctx)
         if (!strcmp(s->stats_file_str, "-")) {
             s->stats_file = stdout;
         } else {
-            s->stats_file = fopen(s->stats_file_str, "w");
+            s->stats_file = avpriv_fopen_utf8(s->stats_file_str, "w");
             if (!s->stats_file) {
                 int err = AVERROR(errno);
                 char buf[128];
@@ -345,25 +349,17 @@ static const AVFilterPad vmafmotion_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_input_ref,
     },
-    { NULL }
 };
 
-static const AVFilterPad vmafmotion_outputs[] = {
-    {
-        .name          = "default",
-        .type          = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_vmafmotion = {
+const AVFilter ff_vf_vmafmotion = {
     .name          = "vmafmotion",
     .description   = NULL_IF_CONFIG_SMALL("Calculate the VMAF Motion score."),
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
     .priv_size     = sizeof(VMAFMotionContext),
     .priv_class    = &vmafmotion_class,
-    .inputs        = vmafmotion_inputs,
-    .outputs       = vmafmotion_outputs,
+    .flags         = AVFILTER_FLAG_METADATA_ONLY,
+    FILTER_INPUTS(vmafmotion_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC(query_formats),
 };

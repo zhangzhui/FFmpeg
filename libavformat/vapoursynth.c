@@ -31,6 +31,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/eval.h"
+#include "libavutil/frame.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
@@ -117,7 +118,8 @@ static av_cold enum AVPixelFormat match_pixfmt(const VSFormat *vsf, int c_order[
         pixfmt = av_pix_fmt_desc_get_id(pd);
 
         if (pd->flags & (AV_PIX_FMT_FLAG_BAYER | AV_PIX_FMT_FLAG_ALPHA |
-                         AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_BITSTREAM))
+                         AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_BITSTREAM |
+                         AV_PIX_FMT_FLAG_XYZ))
             continue;
 
         if (pd->log2_chroma_w != vsf->subSamplingW ||
@@ -138,9 +140,6 @@ static av_cold enum AVPixelFormat match_pixfmt(const VSFormat *vsf, int c_order[
             continue;
 
         if (av_pix_fmt_count_planes(pixfmt) != vsf->numPlanes)
-            continue;
-
-        if (strncmp(pd->name, "xyz", 3) == 0)
             continue;
 
         if (!is_native_endian(pixfmt))
@@ -294,8 +293,6 @@ static av_cold int read_header_vs(AVFormatContext *s)
 
 done:
     av_free(buf);
-    if (err < 0)
-        read_close_vs(s);
     return err;
 }
 
@@ -469,7 +466,7 @@ static int read_seek_vs(AVFormatContext *s, int stream_idx, int64_t ts, int flag
     return 0;
 }
 
-static av_cold int probe_vs(AVProbeData *p)
+static av_cold int probe_vs(const AVProbeData *p)
 {
     // Explicitly do not support this. VS scripts are written in Python, and
     // can run arbitrary code on the user's system.
@@ -483,10 +480,11 @@ static const AVClass class_vs = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVInputFormat ff_vapoursynth_demuxer = {
+const AVInputFormat ff_vapoursynth_demuxer = {
     .name           = "vapoursynth",
     .long_name      = NULL_IF_CONFIG_SMALL("VapourSynth demuxer"),
     .priv_data_size = sizeof(VSContext),
+    .flags_internal = FF_FMT_INIT_CLEANUP,
     .read_probe     = probe_vs,
     .read_header    = read_header_vs,
     .read_packet    = read_packet_vs,

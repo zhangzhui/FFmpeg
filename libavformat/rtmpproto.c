@@ -24,6 +24,8 @@
  * RTMP protocol
  */
 
+#include "config_components.h"
+
 #include "libavcodec/bytestream.h"
 #include "libavutil/avstring.h"
 #include "libavutil/base64.h"
@@ -42,13 +44,13 @@
 #include "rtmpcrypt.h"
 #include "rtmppkt.h"
 #include "url.h"
+#include "version.h"
 
 #if CONFIG_ZLIB
 #include <zlib.h>
 #endif
 
 #define APP_MAX_LENGTH 1024
-#define PLAYPATH_MAX_LENGTH 512
 #define TCURL_MAX_LENGTH 1024
 #define FLASHVER_MAX_LENGTH 64
 #define RTMP_PKTDATA_DEFAULT_SIZE 4096
@@ -124,6 +126,8 @@ typedef struct RTMPContext {
     int           listen_timeout;             ///< listen timeout to wait for new connections
     int           nb_streamid;                ///< The next stream id to return on createStream calls
     double        duration;                   ///< Duration of the stream in seconds as returned by the server (only valid if non-zero)
+    int           tcp_nodelay;                ///< Use TCP_NODELAY to disable Nagle's algorithm if set to 1
+    char          *enhanced_codecs;           ///< codec list in enhanced rtmp
     char          username[50];
     char          password[50];
     char          auth_params[500];
@@ -164,7 +168,7 @@ static int add_tracked_method(RTMPContext *rt, const char *name, int id)
 
     if (rt->nb_tracked_methods + 1 > rt->tracked_methods_size) {
         rt->tracked_methods_size = (rt->nb_tracked_methods + 1) * 2;
-        if ((err = av_reallocp(&rt->tracked_methods, rt->tracked_methods_size *
+        if ((err = av_reallocp_array(&rt->tracked_methods, rt->tracked_methods_size,
                                sizeof(*rt->tracked_methods))) < 0) {
             rt->nb_tracked_methods = 0;
             rt->tracked_methods_size = 0;
@@ -332,6 +336,38 @@ static int gen_connect(URLContext *s, RTMPContext *rt)
     ff_amf_write_object_start(&p);
     ff_amf_write_field_name(&p, "app");
     ff_amf_write_string2(&p, rt->app, rt->auth_params);
+
+    if (rt->enhanced_codecs) {
+        uint32_t list_len = 0;
+        char *fourcc_data = rt->enhanced_codecs;
+        int fourcc_str_len = strlen(fourcc_data);
+
+        // check the string, fourcc + ',' + ...  + end fourcc correct length should be (4+1)*n+4
+        if ((fourcc_str_len + 1) % 5 != 0) {
+            av_log(s, AV_LOG_ERROR, "Malformed rtmp_enhanched_codecs, "
+                   "should be of the form hvc1[,av01][,vp09][,...]\n");
+            return AVERROR(EINVAL);
+        }
+
+        list_len = (fourcc_str_len + 1) / 5;
+        ff_amf_write_field_name(&p, "fourCcList");
+        ff_amf_write_array_start(&p, list_len);
+
+        while(fourcc_data - rt->enhanced_codecs < fourcc_str_len) {
+            unsigned char fourcc[5];
+            if (!strncmp(fourcc_data, "hvc1", 4) ||
+                !strncmp(fourcc_data, "av01", 4) ||
+                !strncmp(fourcc_data, "vp09", 4)) {
+                    av_strlcpy(fourcc, fourcc_data, sizeof(fourcc));
+                    ff_amf_write_string(&p, fourcc);
+            } else {
+                    av_log(s, AV_LOG_ERROR, "Unsupported codec fourcc, %.*s\n", 4, fourcc_data);
+                    return AVERROR_PATCHWELCOME;
+            }
+
+            fourcc_data += 5;
+        }
+    }
 
     if (!rt->is_input) {
         ff_amf_write_field_name(&p, "type");
@@ -1112,7 +1148,7 @@ static int rtmp_calc_swfhash(URLContext *s)
     RTMPContext *rt = s->priv_data;
     uint8_t *in_data = NULL, *out_data = NULL, *swfdata;
     int64_t in_size;
-    URLContext *stream;
+    URLContext *stream = NULL;
     char swfhash[32];
     int swfsize;
     int ret = 0;
@@ -1663,7 +1699,6 @@ static int do_llnw_auth(RTMPContext *rt, const char *user, const char *nonce)
     av_md5_update(md5, rt->password, strlen(rt->password));
     av_md5_final(md5, hash);
     ff_data_to_hex(hashstr1, hash, 16, 1);
-    hashstr1[32] = '\0';
 
     av_md5_init(md5);
     av_md5_update(md5, method, strlen(method));
@@ -1673,7 +1708,6 @@ static int do_llnw_auth(RTMPContext *rt, const char *user, const char *nonce)
         av_md5_update(md5, "/_definst_", strlen("/_definst_"));
     av_md5_final(md5, hash);
     ff_data_to_hex(hashstr2, hash, 16, 1);
-    hashstr2[32] = '\0';
 
     av_md5_init(md5);
     av_md5_update(md5, hashstr1, strlen(hashstr1));
@@ -1856,11 +1890,10 @@ static int write_begin(URLContext *s)
 }
 
 static int write_status(URLContext *s, RTMPPacket *pkt,
-                        const char *status, const char *filename)
+                        const char *status, const char *description, const char *details)
 {
     RTMPContext *rt = s->priv_data;
     RTMPPacket spkt = { 0 };
-    char statusmsg[128];
     uint8_t *pp;
     int ret;
 
@@ -1883,11 +1916,11 @@ static int write_status(URLContext *s, RTMPPacket *pkt,
     ff_amf_write_field_name(&pp, "code");
     ff_amf_write_string(&pp, status);
     ff_amf_write_field_name(&pp, "description");
-    snprintf(statusmsg, sizeof(statusmsg),
-             "%s is now published", filename);
-    ff_amf_write_string(&pp, statusmsg);
-    ff_amf_write_field_name(&pp, "details");
-    ff_amf_write_string(&pp, filename);
+    ff_amf_write_string(&pp, description);
+    if (details) {
+        ff_amf_write_field_name(&pp, "details");
+        ff_amf_write_string(&pp, details);
+    }
     ff_amf_write_object_end(&pp);
 
     spkt.size = pp - spkt.data;
@@ -1963,20 +1996,22 @@ static int send_invoke_response(URLContext *s, RTMPPacket *pkt)
         pp = spkt.data;
         ff_amf_write_string(&pp, "onFCPublish");
     } else if (!strcmp(command, "publish")) {
+        char statusmsg[128];
+        snprintf(statusmsg, sizeof(statusmsg), "%s is now published", filename);
         ret = write_begin(s);
         if (ret < 0)
             return ret;
 
         // Send onStatus(NetStream.Publish.Start)
         return write_status(s, pkt, "NetStream.Publish.Start",
-                           filename);
+                            statusmsg, filename);
     } else if (!strcmp(command, "play")) {
         ret = write_begin(s);
         if (ret < 0)
             return ret;
         rt->state = STATE_SENDING;
         return write_status(s, pkt, "NetStream.Play.Start",
-                            filename);
+                            "playing stream", NULL);
     } else {
         if ((ret = ff_rtmp_packet_create(&spkt, RTMP_SYSTEM_CHANNEL,
                                          RTMP_PT_INVOKE, 0,
@@ -2386,7 +2421,7 @@ static int handle_metadata(RTMPContext *rt, RTMPPacket *pkt)
         next += size + 3 + 4;
     }
     if (p != rt->flv_data + rt->flv_size) {
-        av_log(NULL, AV_LOG_WARNING, "Incomplete flv packets in "
+        av_log(rt, AV_LOG_WARNING, "Incomplete flv packets in "
                                      "RTMP_PT_METADATA packet\n");
         rt->flv_size = p - rt->flv_data;
     }
@@ -2512,7 +2547,7 @@ static int rtmp_close(URLContext *h)
 
     free_tracked_methods(rt);
     av_freep(&rt->flv_data);
-    ffurl_close(rt->stream);
+    ffurl_closep(&rt->stream);
     return ret;
 }
 
@@ -2654,10 +2689,10 @@ static int rtmp_open(URLContext *s, const char *uri, int flags, AVDictionary **o
             port = RTMP_DEFAULT_PORT;
         if (rt->listen)
             ff_url_join(buf, sizeof(buf), "tcp", NULL, hostname, port,
-                        "?listen&listen_timeout=%d",
-                        rt->listen_timeout * 1000);
+                        "?listen&listen_timeout=%d&tcp_nodelay=%d",
+                        rt->listen_timeout * 1000, rt->tcp_nodelay);
         else
-            ff_url_join(buf, sizeof(buf), "tcp", NULL, hostname, port, NULL);
+            ff_url_join(buf, sizeof(buf), "tcp", NULL, hostname, port, "?tcp_nodelay=%d", rt->tcp_nodelay);
     }
 
 reconnect:
@@ -2746,7 +2781,10 @@ reconnect:
     }
 
     if (!rt->playpath) {
-        rt->playpath = av_malloc(PLAYPATH_MAX_LENGTH);
+        int max_len = 1;
+        if (fname)
+            max_len = strlen(fname) + 5; // add prefix "mp4:"
+        rt->playpath = av_malloc(max_len);
         if (!rt->playpath) {
             ret = AVERROR(ENOMEM);
             goto fail;
@@ -2763,7 +2801,7 @@ reconnect:
                     fname[len - 4] = '\0';
                 rt->playpath[0] = 0;
             }
-            av_strlcat(rt->playpath, fname, PLAYPATH_MAX_LENGTH);
+            av_strlcat(rt->playpath, fname, max_len);
         } else {
             rt->playpath[0] = '\0';
         }
@@ -2822,8 +2860,7 @@ reconnect:
 
     if (rt->do_reconnect) {
         int i;
-        ffurl_close(rt->stream);
-        rt->stream       = NULL;
+        ffurl_closep(&rt->stream);
         rt->do_reconnect = 0;
         rt->nb_invokes   = 0;
         for (i = 0; i < 2; i++)
@@ -2880,6 +2917,9 @@ reconnect:
     return 0;
 
 fail:
+    av_freep(&rt->playpath);
+    av_freep(&rt->tcurl);
+    av_freep(&rt->flashver);
     av_dict_free(opts);
     rtmp_close(s);
     return ret;
@@ -3097,10 +3137,11 @@ static const AVOption rtmp_options[] = {
     {"rtmp_conn", "Append arbitrary AMF data to the Connect message", OFFSET(conn), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC|ENC},
     {"rtmp_flashver", "Version of the Flash plugin used to run the SWF player.", OFFSET(flashver), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC|ENC},
     {"rtmp_flush_interval", "Number of packets flushed in the same request (RTMPT only).", OFFSET(flush_interval), AV_OPT_TYPE_INT, {.i64 = 10}, 0, INT_MAX, ENC},
-    {"rtmp_live", "Specify that the media is a live stream.", OFFSET(live), AV_OPT_TYPE_INT, {.i64 = -2}, INT_MIN, INT_MAX, DEC, "rtmp_live"},
-    {"any", "both", 0, AV_OPT_TYPE_CONST, {.i64 = -2}, 0, 0, DEC, "rtmp_live"},
-    {"live", "live stream", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, DEC, "rtmp_live"},
-    {"recorded", "recorded stream", 0, AV_OPT_TYPE_CONST, {.i64 = 0}, 0, 0, DEC, "rtmp_live"},
+    {"rtmp_enhanced_codecs", "Specify the codec(s) to use in an enhanced rtmp live stream", OFFSET(enhanced_codecs), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, ENC},
+    {"rtmp_live", "Specify that the media is a live stream.", OFFSET(live), AV_OPT_TYPE_INT, {.i64 = -2}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_live"},
+    {"any", "both", 0, AV_OPT_TYPE_CONST, {.i64 = -2}, 0, 0, DEC, .unit = "rtmp_live"},
+    {"live", "live stream", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, DEC, .unit = "rtmp_live"},
+    {"recorded", "recorded stream", 0, AV_OPT_TYPE_CONST, {.i64 = 0}, 0, 0, DEC, .unit = "rtmp_live"},
     {"rtmp_pageurl", "URL of the web page in which the media was embedded. By default no value will be sent.", OFFSET(pageurl), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC},
     {"rtmp_playpath", "Stream identifier to play or to publish", OFFSET(playpath), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC|ENC},
     {"rtmp_subscribe", "Name of live stream to subscribe to. Defaults to rtmp_playpath.", OFFSET(subscribe), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC},
@@ -3109,13 +3150,15 @@ static const AVOption rtmp_options[] = {
     {"rtmp_swfurl", "URL of the SWF player. By default no value will be sent", OFFSET(swfurl), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC|ENC},
     {"rtmp_swfverify", "URL to player swf file, compute hash/size automatically.", OFFSET(swfverify), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC},
     {"rtmp_tcurl", "URL of the target stream. Defaults to proto://host[:port]/app.", OFFSET(tcurl), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC|ENC},
-    {"rtmp_listen", "Listen for incoming rtmp connections", OFFSET(listen), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC, "rtmp_listen" },
-    {"listen",      "Listen for incoming rtmp connections", OFFSET(listen), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC, "rtmp_listen" },
-    {"timeout", "Maximum timeout (in seconds) to wait for incoming connections. -1 is infinite. Implies -rtmp_listen 1",  OFFSET(listen_timeout), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, DEC, "rtmp_listen" },
+    {"rtmp_listen", "Listen for incoming rtmp connections", OFFSET(listen), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_listen" },
+    {"listen",      "Listen for incoming rtmp connections", OFFSET(listen), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_listen" },
+    {"tcp_nodelay", "Use TCP_NODELAY to disable Nagle's algorithm", OFFSET(tcp_nodelay), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, DEC|ENC},
+    {"timeout", "Maximum timeout (in seconds) to wait for incoming connections. -1 is infinite. Implies -rtmp_listen 1",  OFFSET(listen_timeout), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_listen" },
     { NULL },
 };
 
-#define RTMP_PROTOCOL(flavor)                    \
+#define RTMP_PROTOCOL_0(flavor)
+#define RTMP_PROTOCOL_1(flavor)                  \
 static const AVClass flavor##_class = {          \
     .class_name = #flavor,                       \
     .item_name  = av_default_item_name,          \
@@ -3135,11 +3178,16 @@ const URLProtocol ff_##flavor##_protocol = {     \
     .flags          = URL_PROTOCOL_FLAG_NETWORK, \
     .priv_data_class= &flavor##_class,           \
 };
+#define RTMP_PROTOCOL_2(flavor, enabled)         \
+    RTMP_PROTOCOL_ ## enabled(flavor)
+#define RTMP_PROTOCOL_3(flavor, config)          \
+    RTMP_PROTOCOL_2(flavor, config)
+#define RTMP_PROTOCOL(flavor, uppercase)         \
+    RTMP_PROTOCOL_3(flavor, CONFIG_ ## uppercase ## _PROTOCOL)
 
-
-RTMP_PROTOCOL(rtmp)
-RTMP_PROTOCOL(rtmpe)
-RTMP_PROTOCOL(rtmps)
-RTMP_PROTOCOL(rtmpt)
-RTMP_PROTOCOL(rtmpte)
-RTMP_PROTOCOL(rtmpts)
+RTMP_PROTOCOL(rtmp,   RTMP)
+RTMP_PROTOCOL(rtmpe,  RTMPE)
+RTMP_PROTOCOL(rtmps,  RTMPS)
+RTMP_PROTOCOL(rtmpt,  RTMPT)
+RTMP_PROTOCOL(rtmpte, RTMPTE)
+RTMP_PROTOCOL(rtmpts, RTMPTS)

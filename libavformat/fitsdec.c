@@ -24,6 +24,7 @@
  * FITS demuxer.
  */
 
+#include "libavutil/avassert.h"
 #include "libavutil/intreadwrite.h"
 #include "internal.h"
 #include "libavutil/opt.h"
@@ -36,10 +37,9 @@ typedef struct FITSContext {
     const AVClass *class;
     AVRational framerate;
     int first_image;
-    int64_t pts;
 } FITSContext;
 
-static int fits_probe(AVProbeData *p)
+static int fits_probe(const AVProbeData *p)
 {
     const uint8_t *b = p->buf;
     if (!memcmp(b, "SIMPLE  =                    T", 30))
@@ -60,7 +60,6 @@ static int fits_read_header(AVFormatContext *s)
     st->codecpar->codec_id = AV_CODEC_ID_FITS;
 
     avpriv_set_pts_info(st, 64, fits->framerate.den, fits->framerate.num);
-    fits->pts = 0;
     fits->first_image = 1;
     return 0;
 }
@@ -125,14 +124,14 @@ static int64_t is_image(AVFormatContext *s, FITSContext *fits, FITSHeader *heade
     size += header->pcount;
 
     t = (abs(header->bitpix) >> 3) * ((int64_t) header->gcount);
-    if(size && t > UINT64_MAX / size)
+    if(size && t > INT64_MAX / size)
         return AVERROR_INVALIDDATA;
     size *= t;
 
     if (!size) {
         image = 0;
     } else {
-        if(FITS_BLOCK_SIZE - 1 > UINT64_MAX - size)
+        if(FITS_BLOCK_SIZE - 1 > INT64_MAX - size)
             return AVERROR_INVALIDDATA;
         size = ((size + FITS_BLOCK_SIZE - 1) / FITS_BLOCK_SIZE) * FITS_BLOCK_SIZE;
     }
@@ -157,11 +156,11 @@ static int fits_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     av_bprint_init(&avbuf, FITS_BLOCK_SIZE, AV_BPRINT_SIZE_UNLIMITED);
     while ((ret = is_image(s, fits, &header, &avbuf, &size)) == 0) {
+        av_bprint_finalize(&avbuf, NULL);
         pos = avio_skip(s->pb, size);
         if (pos < 0)
             return pos;
 
-        av_bprint_finalize(&avbuf, NULL);
         av_bprint_init(&avbuf, FITS_BLOCK_SIZE, AV_BPRINT_SIZE_UNLIMITED);
         avpriv_fits_header_init(&header, STATE_XTENSION);
     }
@@ -173,6 +172,11 @@ static int fits_read_packet(AVFormatContext *s, AVPacket *pkt)
         goto fail;
     }
 
+    av_assert0(avbuf.len <= INT64_MAX && size <= INT64_MAX);
+    if (avbuf.len + size > INT_MAX - 80)  {
+        ret = AVERROR_INVALIDDATA;
+        goto fail;
+    }
     // Header is sent with the first line removed...
     ret = av_new_packet(pkt, avbuf.len - 80 + size);
     if (ret < 0)
@@ -183,7 +187,6 @@ static int fits_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     ret = av_bprint_finalize(&avbuf, &buf);
     if (ret < 0) {
-        av_packet_unref(pkt);
         return ret;
     }
 
@@ -191,14 +194,11 @@ static int fits_read_packet(AVFormatContext *s, AVPacket *pkt)
     pkt->size = avbuf.len - 80;
     av_freep(&buf);
     ret = avio_read(s->pb, pkt->data + pkt->size, size);
-    if (ret < 0) {
-        av_packet_unref(pkt);
+    if (ret < 0)
         return ret;
-    }
 
     pkt->size += ret;
-    pkt->pts = fits->pts;
-    fits->pts++;
+    pkt->duration = 1;
 
     return 0;
 
@@ -217,9 +217,10 @@ static const AVClass fits_demuxer_class = {
     .item_name  = av_default_item_name,
     .option     = fits_options,
     .version    = LIBAVUTIL_VERSION_INT,
+    .category   = AV_CLASS_CATEGORY_DEMUXER,
 };
 
-AVInputFormat ff_fits_demuxer = {
+const AVInputFormat ff_fits_demuxer = {
     .name           = "fits",
     .long_name      = NULL_IF_CONFIG_SMALL("Flexible Image Transport System"),
     .priv_data_size = sizeof(FITSContext),
@@ -227,5 +228,5 @@ AVInputFormat ff_fits_demuxer = {
     .read_header    = fits_read_header,
     .read_packet    = fits_read_packet,
     .priv_class     = &fits_demuxer_class,
-    .raw_codec_id   = AV_CODEC_ID_FITS,
+    .flags          = AVFMT_NOTIMESTAMPS,
 };

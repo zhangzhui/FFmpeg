@@ -17,15 +17,13 @@
  */
 #include <string.h>
 
-#include "libavutil/avassert.h"
-#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "formats.h"
 #include "internal.h"
 #include "vaapi_vpp.h"
+#include "video.h"
 
 // Denoise min/max/default Values
 #define DENOISE_MIN            0
@@ -84,10 +82,9 @@ static int denoise_vaapi_build_filter_params(AVFilterContext *avctx)
     denoise.value =  map(ctx->denoise, DENOISE_MIN, DENOISE_MAX,
                          caps.range.min_value,
                          caps.range.max_value);
-    ff_vaapi_vpp_make_param_buffers(avctx, VAProcFilterParameterBufferType,
-                                    &denoise, sizeof(denoise), 1);
-
-    return 0;
+    return ff_vaapi_vpp_make_param_buffers(avctx,
+                                           VAProcFilterParameterBufferType,
+                                           &denoise, sizeof(denoise), 1);
 }
 
 static int sharpness_vaapi_build_filter_params(AVFilterContext *avctx)
@@ -116,11 +113,9 @@ static int sharpness_vaapi_build_filter_params(AVFilterContext *avctx)
                           SHARPNESS_MIN, SHARPNESS_MAX,
                           caps.range.min_value,
                           caps.range.max_value);
-    ff_vaapi_vpp_make_param_buffers(avctx,
-                                    VAProcFilterParameterBufferType,
-                                    &sharpness, sizeof(sharpness), 1);
-
-    return 0;
+    return ff_vaapi_vpp_make_param_buffers(avctx,
+                                           VAProcFilterParameterBufferType,
+                                           &sharpness, sizeof(sharpness), 1);
 }
 
 static int misc_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame)
@@ -129,9 +124,6 @@ static int misc_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame)
     AVFilterLink *outlink    = avctx->outputs[0];
     VAAPIVPPContext *vpp_ctx = avctx->priv;
     AVFrame *output_frame    = NULL;
-    VASurfaceID input_surface, output_surface;
-    VARectangle input_region;
-
     VAProcPipelineParameterBuffer params;
     int err;
 
@@ -139,12 +131,11 @@ static int misc_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame)
            av_get_pix_fmt_name(input_frame->format),
            input_frame->width, input_frame->height, input_frame->pts);
 
+    if (vpp_ctx->passthrough)
+        return ff_filter_frame(outlink, input_frame);
+
     if (vpp_ctx->va_context == VA_INVALID_ID)
         return AVERROR(EINVAL);
-
-    input_surface = (VASurfaceID)(uintptr_t)input_frame->data[3];
-    av_log(avctx, AV_LOG_DEBUG, "Using surface %#x for misc vpp input.\n",
-           input_surface);
 
     output_frame = ff_get_video_buffer(outlink, vpp_ctx->output_width,
                                        vpp_ctx->output_height);
@@ -153,40 +144,24 @@ static int misc_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame)
         goto fail;
     }
 
-    output_surface = (VASurfaceID)(uintptr_t)output_frame->data[3];
-    av_log(avctx, AV_LOG_DEBUG, "Using surface %#x for misc vpp output.\n",
-           output_surface);
-    memset(&params, 0, sizeof(params));
-    input_region = (VARectangle) {
-        .x      = 0,
-        .y      = 0,
-        .width  = input_frame->width,
-        .height = input_frame->height,
-    };
+    err = av_frame_copy_props(output_frame, input_frame);
+    if (err < 0)
+        goto fail;
+
+    err = ff_vaapi_vpp_init_params(avctx, &params,
+                                   input_frame, output_frame);
+    if (err < 0)
+        goto fail;
 
     if (vpp_ctx->nb_filter_buffers) {
         params.filters     = &vpp_ctx->filter_buffers[0];
         params.num_filters = vpp_ctx->nb_filter_buffers;
     }
-    params.surface = input_surface;
-    params.surface_region = &input_region;
-    params.surface_color_standard =
-        ff_vaapi_vpp_colour_standard(input_frame->colorspace);
 
-    params.output_region = NULL;
-    params.output_background_color = VAAPI_VPP_BACKGROUND_BLACK;
-    params.output_color_standard = params.surface_color_standard;
-
-    params.pipeline_flags = 0;
-    params.filter_flags = VA_FRAME_PICTURE;
-
-    err = ff_vaapi_vpp_render_picture(avctx, &params, output_surface);
+    err = ff_vaapi_vpp_render_picture(avctx, &params, output_frame);
     if (err < 0)
         goto fail;
 
-    err = av_frame_copy_props(output_frame, input_frame);
-    if (err < 0)
-        goto fail;
     av_frame_free(&input_frame);
 
     av_log(avctx, AV_LOG_DEBUG, "Filter output: %s, %ux%u (%"PRId64").\n",
@@ -204,11 +179,14 @@ fail:
 static av_cold int denoise_vaapi_init(AVFilterContext *avctx)
 {
     VAAPIVPPContext *vpp_ctx = avctx->priv;
+    DenoiseVAAPIContext *ctx = avctx->priv;
 
     ff_vaapi_vpp_ctx_init(avctx);
     vpp_ctx->pipeline_uninit     = ff_vaapi_vpp_pipeline_uninit;
     vpp_ctx->build_filter_params = denoise_vaapi_build_filter_params;
     vpp_ctx->output_format       = AV_PIX_FMT_NONE;
+    if (ctx->denoise == DENOISE_DEFAULT)
+        vpp_ctx->passthrough = 1;
 
     return 0;
 }
@@ -216,11 +194,14 @@ static av_cold int denoise_vaapi_init(AVFilterContext *avctx)
 static av_cold int sharpness_vaapi_init(AVFilterContext *avctx)
 {
     VAAPIVPPContext *vpp_ctx = avctx->priv;
+    SharpnessVAAPIContext *ctx = avctx->priv;
 
     ff_vaapi_vpp_ctx_init(avctx);
     vpp_ctx->pipeline_uninit     = ff_vaapi_vpp_pipeline_uninit;
     vpp_ctx->build_filter_params = sharpness_vaapi_build_filter_params;
     vpp_ctx->output_format       = AV_PIX_FMT_NONE;
+    if (ctx->sharpness == SHARPNESS_DEFAULT)
+        vpp_ctx->passthrough = 1;
 
     return 0;
 }
@@ -250,7 +231,6 @@ static const AVFilterPad misc_vaapi_inputs[] = {
         .filter_frame = &misc_vaapi_filter_frame,
         .config_props = &ff_vaapi_vpp_config_input,
     },
-    { NULL }
 };
 
 static const AVFilterPad misc_vaapi_outputs[] = {
@@ -259,31 +239,30 @@ static const AVFilterPad misc_vaapi_outputs[] = {
         .type = AVMEDIA_TYPE_VIDEO,
         .config_props = &ff_vaapi_vpp_config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_denoise_vaapi = {
+const AVFilter ff_vf_denoise_vaapi = {
     .name          = "denoise_vaapi",
     .description   = NULL_IF_CONFIG_SMALL("VAAPI VPP for de-noise"),
     .priv_size     = sizeof(DenoiseVAAPIContext),
     .init          = &denoise_vaapi_init,
     .uninit        = &ff_vaapi_vpp_ctx_uninit,
-    .query_formats = &ff_vaapi_vpp_query_formats,
-    .inputs        = misc_vaapi_inputs,
-    .outputs       = misc_vaapi_outputs,
+    FILTER_INPUTS(misc_vaapi_inputs),
+    FILTER_OUTPUTS(misc_vaapi_outputs),
+    FILTER_QUERY_FUNC(&ff_vaapi_vpp_query_formats),
     .priv_class    = &denoise_vaapi_class,
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 
-AVFilter ff_vf_sharpness_vaapi = {
+const AVFilter ff_vf_sharpness_vaapi = {
     .name          = "sharpness_vaapi",
     .description   = NULL_IF_CONFIG_SMALL("VAAPI VPP for sharpness"),
     .priv_size     = sizeof(SharpnessVAAPIContext),
     .init          = &sharpness_vaapi_init,
     .uninit        = &ff_vaapi_vpp_ctx_uninit,
-    .query_formats = &ff_vaapi_vpp_query_formats,
-    .inputs        = misc_vaapi_inputs,
-    .outputs       = misc_vaapi_outputs,
+    FILTER_INPUTS(misc_vaapi_inputs),
+    FILTER_OUTPUTS(misc_vaapi_outputs),
+    FILTER_QUERY_FUNC(&ff_vaapi_vpp_query_formats),
     .priv_class    = &sharpness_vaapi_class,
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };

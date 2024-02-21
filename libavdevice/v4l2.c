@@ -32,6 +32,18 @@
 
 #include <stdatomic.h>
 
+#include "libavutil/avassert.h"
+#include "libavutil/avstring.h"
+#include "libavutil/imgutils.h"
+#include "libavutil/parseutils.h"
+#include "libavutil/pixdesc.h"
+#include "libavutil/time.h"
+#include "libavcodec/avcodec.h"
+#include "libavcodec/codec_desc.h"
+#include "libavformat/demux.h"
+#include "libavformat/internal.h"
+#include "avdevice.h"
+#include "timefilter.h"
 #include "v4l2-common.h"
 #include <dirent.h>
 
@@ -538,11 +550,10 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
             s->frame_size = buf.bytesused;
 
         if (s->frame_size > 0 && buf.bytesused != s->frame_size) {
-            av_log(ctx, AV_LOG_ERROR,
+            av_log(ctx, AV_LOG_WARNING,
                    "Dequeued v4l2 buffer contains %d bytes, but %d were expected. Flags: 0x%08X.\n",
                    buf.bytesused, s->frame_size, buf.flags);
-            enqueue_buffer(s, &buf);
-            return AVERROR_INVALIDDATA;
+            buf.bytesused = 0;
         }
     }
 
@@ -812,11 +823,12 @@ static int device_try_init(AVFormatContext *ctx,
     }
 
     *codec_id = ff_fmt_v4l2codec(*desired_format);
-    av_assert0(*codec_id != AV_CODEC_ID_NONE);
+    if (*codec_id == AV_CODEC_ID_NONE)
+        av_assert0(ret == AVERROR(EINVAL));
     return ret;
 }
 
-static int v4l2_read_probe(AVProbeData *p)
+static int v4l2_read_probe(const AVProbeData *p)
 {
     if (av_strstart(p->filename, "/dev/video", NULL))
         return AVPROBE_SCORE_MAX - 1;
@@ -961,7 +973,7 @@ static int v4l2_read_header(AVFormatContext *ctx)
         st->codecpar->codec_tag =
             avcodec_pix_fmt_to_codec_tag(st->codecpar->format);
     else if (codec_id == AV_CODEC_ID_H264) {
-        st->need_parsing = AVSTREAM_PARSE_FULL_ONCE;
+        avpriv_stream_set_need_parsing(st, AVSTREAM_PARSE_FULL_ONCE);
     }
     if (desired_format == V4L2_PIX_FMT_YVU420)
         st->codecpar->codec_tag = MKTAG('Y', 'V', '1', '2');
@@ -981,26 +993,11 @@ fail:
 
 static int v4l2_read_packet(AVFormatContext *ctx, AVPacket *pkt)
 {
-#if FF_API_CODED_FRAME && FF_API_LAVF_AVCTX
-FF_DISABLE_DEPRECATION_WARNINGS
-    struct video_data *s = ctx->priv_data;
-    AVFrame *frame = ctx->streams[0]->codec->coded_frame;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
     int res;
 
     if ((res = mmap_read_frame(ctx, pkt)) < 0) {
         return res;
     }
-
-#if FF_API_CODED_FRAME && FF_API_LAVF_AVCTX
-FF_DISABLE_DEPRECATION_WARNINGS
-    if (frame && s->interlaced) {
-        frame->interlaced_frame = 1;
-        frame->top_field_first = s->top_field_first;
-    }
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
     return pkt->size;
 }
@@ -1015,6 +1012,7 @@ static int v4l2_read_close(AVFormatContext *ctx)
 
     mmap_close(s);
 
+    ff_timefilter_destroy(s->timefilter);
     v4l2_close(s->fd);
     return 0;
 }
@@ -1032,8 +1030,6 @@ static int v4l2_get_device_list(AVFormatContext *ctx, AVDeviceInfoList *device_l
     struct video_data *s = ctx->priv_data;
     DIR *dir;
     struct dirent *entry;
-    AVDeviceInfo *device = NULL;
-    struct v4l2_capability cap;
     int ret = 0;
 
     if (!device_list)
@@ -1046,16 +1042,25 @@ static int v4l2_get_device_list(AVFormatContext *ctx, AVDeviceInfoList *device_l
         return ret;
     }
     while ((entry = readdir(dir))) {
+        AVDeviceInfo *device = NULL;
+        struct v4l2_capability cap;
+        int fd = -1, size;
         char device_name[256];
 
         if (!v4l2_is_v4l_dev(entry->d_name))
             continue;
 
-        snprintf(device_name, sizeof(device_name), "/dev/%s", entry->d_name);
-        if ((s->fd = device_open(ctx, device_name)) < 0)
+        size = snprintf(device_name, sizeof(device_name), "/dev/%s", entry->d_name);
+        if (size >= sizeof(device_name)) {
+            av_log(ctx, AV_LOG_ERROR, "Device name too long.\n");
+            ret = AVERROR(ENOSYS);
+            break;
+        }
+
+        if ((fd = device_open(ctx, device_name)) < 0)
             continue;
 
-        if (v4l2_ioctl(s->fd, VIDIOC_QUERYCAP, &cap) < 0) {
+        if (v4l2_ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
             ret = AVERROR(errno);
             av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_QUERYCAP): %s\n", av_err2str(ret));
             goto fail;
@@ -1077,8 +1082,7 @@ static int v4l2_get_device_list(AVFormatContext *ctx, AVDeviceInfoList *device_l
                                           &device_list->nb_devices, device)) < 0)
             goto fail;
 
-        v4l2_close(s->fd);
-        s->fd = -1;
+        v4l2_close(fd);
         continue;
 
       fail:
@@ -1087,9 +1091,7 @@ static int v4l2_get_device_list(AVFormatContext *ctx, AVDeviceInfoList *device_l
             av_freep(&device->device_description);
             av_freep(&device);
         }
-        if (s->fd >= 0)
-            v4l2_close(s->fd);
-        s->fd = -1;
+        v4l2_close(fd);
         break;
     }
     closedir(dir);
@@ -1107,19 +1109,19 @@ static const AVOption options[] = {
     { "input_format", "set preferred pixel format (for raw video) or codec name", OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "framerate",    "set frame rate",                                           OFFSET(framerate),    AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
 
-    { "list_formats", "list available formats and exit",                          OFFSET(list_format),  AV_OPT_TYPE_INT,    {.i64 = 0 },  0, INT_MAX, DEC, "list_formats" },
-    { "all",          "show all available formats",                               OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_ALLFORMATS  },    0, INT_MAX, DEC, "list_formats" },
-    { "raw",          "show only non-compressed formats",                         OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_RAWFORMATS  },    0, INT_MAX, DEC, "list_formats" },
-    { "compressed",   "show only compressed formats",                             OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_COMPFORMATS },    0, INT_MAX, DEC, "list_formats" },
+    { "list_formats", "list available formats and exit",                          OFFSET(list_format),  AV_OPT_TYPE_INT,    {.i64 = 0 },  0, INT_MAX, DEC, .unit = "list_formats" },
+    { "all",          "show all available formats",                               OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_ALLFORMATS  },    0, INT_MAX, DEC, .unit = "list_formats" },
+    { "raw",          "show only non-compressed formats",                         OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_RAWFORMATS  },    0, INT_MAX, DEC, .unit = "list_formats" },
+    { "compressed",   "show only compressed formats",                             OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_COMPFORMATS },    0, INT_MAX, DEC, .unit = "list_formats" },
 
-    { "list_standards", "list supported standards and exit",                      OFFSET(list_standard), AV_OPT_TYPE_INT,   {.i64 = 0 },  0, 1, DEC, "list_standards" },
-    { "all",            "show all supported standards",                           OFFSET(list_standard), AV_OPT_TYPE_CONST, {.i64 = 1 },  0, 0, DEC, "list_standards" },
+    { "list_standards", "list supported standards and exit",                      OFFSET(list_standard), AV_OPT_TYPE_INT,   {.i64 = 0 },  0, 1, DEC, .unit = "list_standards" },
+    { "all",            "show all supported standards",                           OFFSET(list_standard), AV_OPT_TYPE_CONST, {.i64 = 1 },  0, 0, DEC, .unit = "list_standards" },
 
-    { "timestamps",   "set type of timestamps for grabbed frames",                OFFSET(ts_mode),      AV_OPT_TYPE_INT,    {.i64 = 0 }, 0, 2, DEC, "timestamps" },
-    { "ts",           "set type of timestamps for grabbed frames",                OFFSET(ts_mode),      AV_OPT_TYPE_INT,    {.i64 = 0 }, 0, 2, DEC, "timestamps" },
-    { "default",      "use timestamps from the kernel",                           OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_DEFAULT  }, 0, 2, DEC, "timestamps" },
-    { "abs",          "use absolute timestamps (wall clock)",                     OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_ABS      }, 0, 2, DEC, "timestamps" },
-    { "mono2abs",     "force conversion from monotonic to absolute timestamps",   OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_MONO2ABS }, 0, 2, DEC, "timestamps" },
+    { "timestamps",   "set type of timestamps for grabbed frames",                OFFSET(ts_mode),      AV_OPT_TYPE_INT,    {.i64 = 0 }, 0, 2, DEC, .unit = "timestamps" },
+    { "ts",           "set type of timestamps for grabbed frames",                OFFSET(ts_mode),      AV_OPT_TYPE_INT,    {.i64 = 0 }, 0, 2, DEC, .unit = "timestamps" },
+    { "default",      "use timestamps from the kernel",                           OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_DEFAULT  }, 0, 2, DEC, .unit = "timestamps" },
+    { "abs",          "use absolute timestamps (wall clock)",                     OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_ABS      }, 0, 2, DEC, .unit = "timestamps" },
+    { "mono2abs",     "force conversion from monotonic to absolute timestamps",   OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_MONO2ABS }, 0, 2, DEC, .unit = "timestamps" },
     { "use_libv4l2",  "use libv4l2 (v4l-utils) conversion functions",             OFFSET(use_libv4l2),  AV_OPT_TYPE_BOOL,   {.i64 = 0}, 0, 1, DEC },
     { NULL },
 };
@@ -1132,7 +1134,7 @@ static const AVClass v4l2_class = {
     .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_INPUT,
 };
 
-AVInputFormat ff_v4l2_demuxer = {
+const AVInputFormat ff_v4l2_demuxer = {
     .name           = "video4linux2,v4l2",
     .long_name      = NULL_IF_CONFIG_SMALL("Video4Linux2 device grab"),
     .priv_data_size = sizeof(struct video_data),

@@ -37,6 +37,8 @@ static int hevc_decode_nal_units(const uint8_t *buf, int buf_size, HEVCParamSets
 
     for (i = 0; i < pkt.nb_nals; i++) {
         H2645NAL *nal = &pkt.nals[i];
+        if (nal->nuh_layer_id > 0)
+            continue;
 
         /* ignore everything except parameter sets and VCL NALUs */
         switch (nal->type) {
@@ -84,11 +86,13 @@ int ff_hevc_decode_extradata(const uint8_t *data, int size, HEVCParamSets *ps,
 
     bytestream2_init(&gb, data, size);
 
-    if (size > 3 && (data[0] || data[1] || data[2] > 1)) {
-        /* It seems the extradata is encoded as hvcC format.
-         * Temporarily, we support configurationVersion==0 until 14496-15 3rd
-         * is finalized. When finalized, configurationVersion will be 1 and we
-         * can recognize hvcC by checking if avctx->extradata[0]==1 or not. */
+    /* data[0] == 1 is configurationVersion from 14496-15.
+     * data[0] == 0 is for backward compatibility predates the standard.
+     *
+     * Minimum number of bytes of hvcC with 0 numOfArrays is 23.
+     */
+    if (size >= 23 && ((data[0] == 1) || (data[0] == 0 && (data[1] || data[2] > 1)))) {
+        /* It seems the extradata is encoded as hvcC format. */
         int i, j, num_arrays, nal_len_size;
 
         *is_nalff = 1;

@@ -20,6 +20,7 @@
  */
 #include "avformat.h"
 #include "internal.h"
+#include "mux.h"
 
 typedef struct RCVContext {
     int frames;
@@ -76,18 +77,17 @@ static int vc1test_write_trailer(AVFormatContext *s)
     if (s->pb->seekable & AVIO_SEEKABLE_NORMAL) {
         avio_seek(pb, 0, SEEK_SET);
         avio_wl24(pb, ctx->frames);
-        avio_flush(pb);
     }
     return 0;
 }
 
-AVOutputFormat ff_vc1t_muxer = {
-    .name              = "vc1test",
-    .long_name         = NULL_IF_CONFIG_SMALL("VC-1 test bitstream"),
-    .extensions        = "rcv",
+const FFOutputFormat ff_vc1t_muxer = {
+    .p.name            = "vc1test",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("VC-1 test bitstream"),
+    .p.extensions      = "rcv",
     .priv_data_size    = sizeof(RCVContext),
-    .audio_codec       = AV_CODEC_ID_NONE,
-    .video_codec       = AV_CODEC_ID_WMV3,
+    .p.audio_codec     = AV_CODEC_ID_NONE,
+    .p.video_codec     = AV_CODEC_ID_WMV3,
     .write_header      = vc1test_write_header,
     .write_packet      = vc1test_write_packet,
     .write_trailer     = vc1test_write_trailer,

@@ -23,11 +23,14 @@
 
 #include <AMF/components/VideoEncoderVCE.h>
 #include <AMF/components/VideoEncoderHEVC.h>
+#include <AMF/components/VideoEncoderAV1.h>
 
 #include "libavutil/fifo.h"
 
 #include "avcodec.h"
+#include "hwconfig.h"
 
+#define  MAX_LOOKAHEAD_DEPTH 41
 
 /**
 * AMF trace writer callback class
@@ -71,7 +74,7 @@ typedef struct AmfContext {
     AVFrame            *delayed_frame;
 
     // shift dts back by max_b_frames in timing
-    AVFifoBuffer       *timestamp_list;
+    AVFifo             *timestamp_list;
     int64_t             dts_delay;
 
     // common encoder option options
@@ -82,7 +85,7 @@ typedef struct AmfContext {
     int                 usage;
     int                 profile;
     int                 level;
-    int                 preanalysis;
+    int                 preencode;
     int                 quality;
     int                 b_frame_delta_qp;
     int                 ref_b_frame_delta_qp;
@@ -105,6 +108,10 @@ typedef struct AmfContext {
     int                 me_half_pel;
     int                 me_quarter_pel;
     int                 aud;
+    int                 max_consecutive_b_frames;
+    int                 max_b_frames;
+    int                 qvbr_quality_level;
+    int                 hw_high_motion_quality_boost;
 
     // HEVC - specific options
 
@@ -115,7 +122,34 @@ typedef struct AmfContext {
     int                 min_qp_p;
     int                 max_qp_p;
     int                 tier;
+
+    // AV1 - specific options
+
+    enum AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_ENUM                 align;
+
+    // Preanalysis - specific options
+
+    int                 preanalysis;
+    int                 pa_activity_type;
+    int                 pa_scene_change_detection;
+    int                 pa_scene_change_detection_sensitivity;
+    int                 pa_static_scene_detection;
+    int                 pa_static_scene_detection_sensitivity;
+    int                 pa_initial_qp;
+    int                 pa_max_qp;
+    int                 pa_caq_strength;
+    int                 pa_frame_sad;
+    int                 pa_ltr;
+    int                 pa_lookahead_buffer_depth;
+    int                 pa_paq_mode;
+    int                 pa_taq_mode;
+    int                 pa_high_motion_quality_boost_mode;
+    int                 pa_adaptive_mini_gop;
+
+
 } AmfContext;
+
+extern const AVCodecHWConfigInternal *const ff_amfenc_hw_configs[];
 
 /**
 * Common encoder initization function
@@ -129,8 +163,6 @@ int ff_amf_encode_close(AVCodecContext *avctx);
 /**
 * Ecoding one frame - common function for all AMF encoders
 */
-
-int ff_amf_send_frame(AVCodecContext *avctx, const AVFrame *frame);
 int ff_amf_receive_packet(AVCodecContext *avctx, AVPacket *avpkt);
 
 /**

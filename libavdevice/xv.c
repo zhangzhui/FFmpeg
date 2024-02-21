@@ -32,10 +32,11 @@
 #include <X11/extensions/Xvlib.h>
 #include <sys/shm.h>
 
+#include "libavutil/frame.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/imgutils.h"
-#include "libavformat/internal.h"
+#include "libavformat/mux.h"
 #include "avdevice.h"
 
 typedef struct {
@@ -113,8 +114,8 @@ static int xv_write_header(AVFormatContext *s)
 
     if (   s->nb_streams > 1
         || par->codec_type != AVMEDIA_TYPE_VIDEO
-        || par->codec_id   != AV_CODEC_ID_RAWVIDEO) {
-        av_log(s, AV_LOG_ERROR, "Only supports one rawvideo stream\n");
+        || (par->codec_id != AV_CODEC_ID_WRAPPED_AVFRAME && par->codec_id != AV_CODEC_ID_RAWVIDEO)) {
+        av_log(s, AV_LOG_ERROR, "Only a single raw or wrapped avframe video stream is supported.\n");
         return AVERROR(EINVAL);
     }
 
@@ -296,7 +297,7 @@ static int write_picture(AVFormatContext *s, uint8_t *input_data[4],
 {
     XVContext *xv = s->priv_data;
     XvImage *img = xv->yuv_image;
-    uint8_t *data[3] = {
+    uint8_t *data[4] = {
         img->data + img->offsets[0],
         img->data + img->offsets[1],
         img->data + img->offsets[2]
@@ -314,20 +315,26 @@ static int write_picture(AVFormatContext *s, uint8_t *input_data[4],
         }
     }
 
-    av_image_copy(data, img->pitches, (const uint8_t **)input_data, linesize,
-                  xv->image_format, img->width, img->height);
+    av_image_copy2(data, img->pitches, input_data, linesize,
+                   xv->image_format, img->width, img->height);
     return xv_repaint(s);
 }
 
 static int xv_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
     AVCodecParameters *par = s->streams[0]->codecpar;
-    uint8_t *data[4];
-    int linesize[4];
 
-    av_image_fill_arrays(data, linesize, pkt->data, par->format,
-                         par->width, par->height, 1);
-    return write_picture(s, data, linesize);
+    if (par->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
+        AVFrame *frame = (AVFrame *)pkt->data;
+        return write_picture(s, frame->data, frame->linesize);
+    } else {
+        uint8_t *data[4];
+        int linesize[4];
+
+        av_image_fill_arrays(data, linesize, pkt->data, par->format,
+                             par->width, par->height, 1);
+        return write_picture(s, data, linesize);
+    }
 }
 
 static int xv_write_frame(AVFormatContext *s, int stream_index, AVFrame **frame,
@@ -370,17 +377,17 @@ static const AVClass xv_class = {
     .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_OUTPUT,
 };
 
-AVOutputFormat ff_xv_muxer = {
-    .name           = "xv",
-    .long_name      = NULL_IF_CONFIG_SMALL("XV (XVideo) output device"),
+const FFOutputFormat ff_xv_muxer = {
+    .p.name         = "xv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("XV (XVideo) output device"),
+    .p.audio_codec   = AV_CODEC_ID_NONE,
+    .p.video_codec   = AV_CODEC_ID_WRAPPED_AVFRAME,
+    .p.flags         = AVFMT_NOFILE | AVFMT_VARIABLE_FPS | AVFMT_NOTIMESTAMPS,
+    .p.priv_class    = &xv_class,
     .priv_data_size = sizeof(XVContext),
-    .audio_codec    = AV_CODEC_ID_NONE,
-    .video_codec    = AV_CODEC_ID_RAWVIDEO,
     .write_header   = xv_write_header,
     .write_packet   = xv_write_packet,
     .write_uncoded_frame = xv_write_frame,
     .write_trailer  = xv_write_trailer,
     .control_message = xv_control_message,
-    .flags          = AVFMT_NOFILE | AVFMT_VARIABLE_FPS | AVFMT_NOTIMESTAMPS,
-    .priv_class     = &xv_class,
 };

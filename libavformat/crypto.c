@@ -19,11 +19,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "avformat.h"
 #include "libavutil/aes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/opt.h"
-#include "internal.h"
 #include "url.h"
 
 // encourage reads of 4096 bytes - 1 block is always retained.
@@ -252,21 +250,17 @@ static int64_t crypto_seek(URLContext *h, int64_t pos, int whence)
     case SEEK_CUR:
         pos = pos + c->position;
         break;
-    case SEEK_END: {
-        int64_t newpos = ffurl_seek( c->hd, pos, AVSEEK_SIZE );
+    case SEEK_END:
+        newpos = ffurl_seek( c->hd, pos, AVSEEK_SIZE );
         if (newpos < 0) {
             av_log(h, AV_LOG_ERROR,
                 "Crypto: seek_end - can't get file size (pos=%lld)\r\n", (long long int)pos);
             return newpos;
         }
         pos = newpos - pos;
-        }
         break;
-    case AVSEEK_SIZE: {
-        int64_t newpos = ffurl_seek( c->hd, pos, AVSEEK_SIZE );
-        return newpos;
-        }
-        break;
+    case AVSEEK_SIZE:
+        return ffurl_seek( c->hd, pos, AVSEEK_SIZE );
     default:
         av_log(h, AV_LOG_ERROR,
             "Crypto: no support for seek where 'whence' is %d\r\n", whence);
@@ -385,8 +379,7 @@ static int crypto_close(URLContext *h)
         ret = ffurl_write(c->hd, out_buf, BLOCKSIZE);
     }
 
-    if (c->hd)
-        ffurl_close(c->hd);
+    ffurl_closep(&c->hd);
     av_freep(&c->aes_decrypt);
     av_freep(&c->aes_encrypt);
     av_freep(&c->write_buf);

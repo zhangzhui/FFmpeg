@@ -19,9 +19,16 @@
  */
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 
+#include "libavcodec/avcodec.h"
+#include "libavcodec/codec_par.h"
+
+#include "libavutil/avassert.h"
+#include "libavutil/iamf.h"
 #include "libavutil/internal.h"
+#include "libavutil/intmath.h"
 #include "libavutil/opt.h"
 
 /**
@@ -38,7 +45,7 @@ static const char* format_to_name(void* ptr)
     AVFormatContext* fc = (AVFormatContext*) ptr;
     if(fc->iformat) return fc->iformat->name;
     else if(fc->oformat) return fc->oformat->name;
-    else return "NULL";
+    else return fc->av_class->class_name;
 }
 
 static void *format_child_next(void *obj, void *prev)
@@ -53,32 +60,60 @@ static void *format_child_next(void *obj, void *prev)
     return NULL;
 }
 
-static const AVClass *format_child_class_next(const AVClass *prev)
+enum {
+    CHILD_CLASS_ITER_AVIO = 0,
+    CHILD_CLASS_ITER_MUX,
+    CHILD_CLASS_ITER_DEMUX,
+    CHILD_CLASS_ITER_DONE,
+
+};
+
+#define ITER_STATE_SHIFT 16
+
+static const AVClass *format_child_class_iterate(void **iter)
 {
-    AVInputFormat  *ifmt = NULL;
-    AVOutputFormat *ofmt = NULL;
+    // we use the low 16 bits of iter as the value to be passed to
+    // av_(de)muxer_iterate()
+    void *val = (void*)(((uintptr_t)*iter) & ((1 << ITER_STATE_SHIFT) - 1));
+    unsigned int state = ((uintptr_t)*iter) >> ITER_STATE_SHIFT;
+    const AVClass *ret = NULL;
 
-    if (!prev)
-        return &ff_avio_class;
+    if (state == CHILD_CLASS_ITER_AVIO) {
+        ret = &ff_avio_class;
+        state++;
+        goto finish;
+    }
 
-    while ((ifmt = av_iformat_next(ifmt)))
-        if (ifmt->priv_class == prev)
-            break;
+    if (state == CHILD_CLASS_ITER_MUX) {
+        const AVOutputFormat *ofmt;
 
-    if (!ifmt)
-        while ((ofmt = av_oformat_next(ofmt)))
-            if (ofmt->priv_class == prev)
-                break;
-    if (!ofmt)
-        while (ifmt = av_iformat_next(ifmt))
-            if (ifmt->priv_class)
-                return ifmt->priv_class;
+        while ((ofmt = av_muxer_iterate(&val))) {
+            ret = ofmt->priv_class;
+            if (ret)
+                goto finish;
+        }
 
-    while (ofmt = av_oformat_next(ofmt))
-        if (ofmt->priv_class)
-            return ofmt->priv_class;
+        val = NULL;
+        state++;
+    }
 
-    return NULL;
+    if (state == CHILD_CLASS_ITER_DEMUX) {
+        const AVInputFormat *ifmt;
+
+        while ((ifmt = av_demuxer_iterate(&val))) {
+            ret = ifmt->priv_class;
+            if (ret)
+                goto finish;
+        }
+        val = NULL;
+        state++;
+    }
+
+finish:
+    // make sure none av_(de)muxer_iterate does not set the high bits of val
+    av_assert0(!((uintptr_t)val >> ITER_STATE_SHIFT));
+    *iter = (void*)((uintptr_t)val | (state << ITER_STATE_SHIFT));
+    return ret;
 }
 
 static AVClassCategory get_category(void *ptr)
@@ -94,7 +129,7 @@ static const AVClass av_format_context_class = {
     .option         = avformat_options,
     .version        = LIBAVUTIL_VERSION_INT,
     .child_next     = format_child_next,
-    .child_class_next = format_child_class_next,
+    .child_class_iterate = format_child_class_iterate,
     .category       = AV_CLASS_CATEGORY_MUXER,
     .get_category   = get_category,
 };
@@ -114,50 +149,53 @@ static int io_open_default(AVFormatContext *s, AVIOContext **pb,
 
     av_log(s, loglevel, "Opening \'%s\' for %s\n", url, flags & AVIO_FLAG_WRITE ? "writing" : "reading");
 
-#if FF_API_OLD_OPEN_CALLBACKS
-FF_DISABLE_DEPRECATION_WARNINGS
-    if (s->open_cb)
-        return s->open_cb(s, pb, url, flags, &s->interrupt_callback, options);
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-
     return ffio_open_whitelist(pb, url, flags, &s->interrupt_callback, options, s->protocol_whitelist, s->protocol_blacklist);
 }
 
-static void io_close_default(AVFormatContext *s, AVIOContext *pb)
+#if FF_API_AVFORMAT_IO_CLOSE
+void ff_format_io_close_default(AVFormatContext *s, AVIOContext *pb)
 {
     avio_close(pb);
 }
+#endif
 
-static void avformat_get_context_defaults(AVFormatContext *s)
+static int io_close2_default(AVFormatContext *s, AVIOContext *pb)
 {
-    memset(s, 0, sizeof(AVFormatContext));
-
-    s->av_class = &av_format_context_class;
-
-    s->io_open  = io_open_default;
-    s->io_close = io_close_default;
-
-    av_opt_set_defaults(s);
+    return avio_close(pb);
 }
 
 AVFormatContext *avformat_alloc_context(void)
 {
-    AVFormatContext *ic;
-    ic = av_malloc(sizeof(AVFormatContext));
-    if (!ic) return ic;
-    avformat_get_context_defaults(ic);
+    FFFormatContext *const si = av_mallocz(sizeof(*si));
+    AVFormatContext *s;
 
-    ic->internal = av_mallocz(sizeof(*ic->internal));
-    if (!ic->internal) {
-        avformat_free_context(ic);
+    if (!si)
+        return NULL;
+
+    s = &si->pub;
+    s->av_class = &av_format_context_class;
+    s->io_open  = io_open_default;
+#if FF_API_AVFORMAT_IO_CLOSE
+FF_DISABLE_DEPRECATION_WARNINGS
+    s->io_close = ff_format_io_close_default;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+    s->io_close2= io_close2_default;
+
+    av_opt_set_defaults(s);
+
+    si->pkt = av_packet_alloc();
+    si->parse_pkt = av_packet_alloc();
+    if (!si->pkt || !si->parse_pkt) {
+        avformat_free_context(s);
         return NULL;
     }
-    ic->internal->offset = AV_NOPTS_VALUE;
-    ic->internal->raw_packet_buffer_remaining_size = RAW_PACKET_BUFFER_SIZE;
-    ic->internal->shortest_end = AV_NOPTS_VALUE;
 
-    return ic;
+#if FF_API_LAVF_SHORTEST
+    si->shortest_end = AV_NOPTS_VALUE;
+#endif
+
+    return s;
 }
 
 enum AVDurationEstimationMethod av_fmt_ctx_get_duration_estimation_method(const AVFormatContext* ctx)
@@ -168,4 +206,307 @@ enum AVDurationEstimationMethod av_fmt_ctx_get_duration_estimation_method(const 
 const AVClass *avformat_get_class(void)
 {
     return &av_format_context_class;
+}
+
+#define DISPOSITION_OPT(ctx)                                                                                                        \
+    { "disposition", NULL, offsetof(ctx, disposition), AV_OPT_TYPE_FLAGS, { .i64 = 0 },                                             \
+        .flags = AV_OPT_FLAG_ENCODING_PARAM, .unit = "disposition" },                                                               \
+        { "default",            .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_DEFAULT           },    .unit = "disposition" }, \
+        { "dub",                .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_DUB               },    .unit = "disposition" }, \
+        { "original",           .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_ORIGINAL          },    .unit = "disposition" }, \
+        { "comment",            .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_COMMENT           },    .unit = "disposition" }, \
+        { "lyrics",             .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_LYRICS            },    .unit = "disposition" }, \
+        { "karaoke",            .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_KARAOKE           },    .unit = "disposition" }, \
+        { "forced",             .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_FORCED            },    .unit = "disposition" }, \
+        { "hearing_impaired",   .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_HEARING_IMPAIRED  },    .unit = "disposition" }, \
+        { "visual_impaired",    .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_VISUAL_IMPAIRED   },    .unit = "disposition" }, \
+        { "clean_effects",      .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_CLEAN_EFFECTS     },    .unit = "disposition" }, \
+        { "attached_pic",       .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_ATTACHED_PIC      },    .unit = "disposition" }, \
+        { "timed_thumbnails",   .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_TIMED_THUMBNAILS  },    .unit = "disposition" }, \
+        { "non_diegetic",       .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_NON_DIEGETIC      },    .unit = "disposition" }, \
+        { "captions",           .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_CAPTIONS          },    .unit = "disposition" }, \
+        { "descriptions",       .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_DESCRIPTIONS      },    .unit = "disposition" }, \
+        { "metadata",           .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_METADATA          },    .unit = "disposition" }, \
+        { "dependent",          .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_DEPENDENT         },    .unit = "disposition" }, \
+        { "still_image",        .type = AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_STILL_IMAGE       },    .unit = "disposition" }
+
+static const AVOption stream_options[] = {
+    DISPOSITION_OPT(AVStream),
+    { "discard", NULL, offsetof(AVStream, discard), AV_OPT_TYPE_INT, { .i64 = AVDISCARD_DEFAULT }, INT_MIN, INT_MAX,
+        .flags = AV_OPT_FLAG_DECODING_PARAM, .unit = "avdiscard" },
+        { "none",               .type = AV_OPT_TYPE_CONST, {.i64 = AVDISCARD_NONE     }, .unit = "avdiscard" },
+        { "default",            .type = AV_OPT_TYPE_CONST, {.i64 = AVDISCARD_DEFAULT  }, .unit = "avdiscard" },
+        { "noref",              .type = AV_OPT_TYPE_CONST, {.i64 = AVDISCARD_NONREF   }, .unit = "avdiscard" },
+        { "bidir",              .type = AV_OPT_TYPE_CONST, {.i64 = AVDISCARD_BIDIR    }, .unit = "avdiscard" },
+        { "nointra",            .type = AV_OPT_TYPE_CONST, {.i64 = AVDISCARD_NONINTRA }, .unit = "avdiscard" },
+        { "nokey",              .type = AV_OPT_TYPE_CONST, {.i64 = AVDISCARD_NONKEY   }, .unit = "avdiscard" },
+        { "all",                .type = AV_OPT_TYPE_CONST, {.i64 = AVDISCARD_ALL      }, .unit = "avdiscard" },
+    { NULL }
+};
+
+static const AVClass stream_class = {
+    .class_name     = "AVStream",
+    .item_name      = av_default_item_name,
+    .version        = LIBAVUTIL_VERSION_INT,
+    .option         = stream_options,
+};
+
+const AVClass *av_stream_get_class(void)
+{
+    return &stream_class;
+}
+
+AVStream *avformat_new_stream(AVFormatContext *s, const AVCodec *c)
+{
+    FFFormatContext *const si = ffformatcontext(s);
+    FFStream *sti;
+    AVStream *st;
+    AVStream **streams;
+
+    if (s->nb_streams >= s->max_streams) {
+        av_log(s, AV_LOG_ERROR, "Number of streams exceeds max_streams parameter"
+               " (%d), see the documentation if you wish to increase it\n",
+               s->max_streams);
+        return NULL;
+    }
+    streams = av_realloc_array(s->streams, s->nb_streams + 1, sizeof(*streams));
+    if (!streams)
+        return NULL;
+    s->streams = streams;
+
+    sti = av_mallocz(sizeof(*sti));
+    if (!sti)
+        return NULL;
+    st = &sti->pub;
+
+    st->av_class = &stream_class;
+    st->codecpar = avcodec_parameters_alloc();
+    if (!st->codecpar)
+        goto fail;
+
+    sti->fmtctx = s;
+
+    if (s->iformat) {
+        sti->avctx = avcodec_alloc_context3(NULL);
+        if (!sti->avctx)
+            goto fail;
+
+        sti->info = av_mallocz(sizeof(*sti->info));
+        if (!sti->info)
+            goto fail;
+
+#if FF_API_R_FRAME_RATE
+        sti->info->last_dts      = AV_NOPTS_VALUE;
+#endif
+        sti->info->fps_first_dts = AV_NOPTS_VALUE;
+        sti->info->fps_last_dts  = AV_NOPTS_VALUE;
+
+        /* default pts setting is MPEG-like */
+        avpriv_set_pts_info(st, 33, 1, 90000);
+        /* we set the current DTS to 0 so that formats without any timestamps
+         * but durations get some timestamps, formats with some unknown
+         * timestamps have their first few packets buffered and the
+         * timestamps corrected before they are returned to the user */
+        sti->cur_dts = RELATIVE_TS_BASE;
+    } else {
+        sti->cur_dts = AV_NOPTS_VALUE;
+    }
+
+    st->index      = s->nb_streams;
+    st->start_time = AV_NOPTS_VALUE;
+    st->duration   = AV_NOPTS_VALUE;
+    sti->first_dts     = AV_NOPTS_VALUE;
+    sti->probe_packets = s->max_probe_packets;
+    sti->pts_wrap_reference = AV_NOPTS_VALUE;
+    sti->pts_wrap_behavior  = AV_PTS_WRAP_IGNORE;
+
+    sti->last_IP_pts = AV_NOPTS_VALUE;
+    sti->last_dts_for_order_check = AV_NOPTS_VALUE;
+    for (int i = 0; i < MAX_REORDER_DELAY + 1; i++)
+        sti->pts_buffer[i] = AV_NOPTS_VALUE;
+
+    st->sample_aspect_ratio = (AVRational) { 0, 1 };
+    sti->transferred_mux_tb = (AVRational) { 0, 1 };;
+
+#if FF_API_AVSTREAM_SIDE_DATA
+    sti->inject_global_side_data = si->inject_global_side_data;
+#endif
+
+    sti->need_context_update = 1;
+
+    s->streams[s->nb_streams++] = st;
+    return st;
+fail:
+    ff_free_stream(&st);
+    return NULL;
+}
+
+static void *stream_group_child_next(void *obj, void *prev)
+{
+    AVStreamGroup *stg = obj;
+    if (!prev) {
+        switch(stg->type) {
+        case AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT:
+            return stg->params.iamf_audio_element;
+        case AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION:
+            return stg->params.iamf_mix_presentation;
+        default:
+            break;
+        }
+    }
+    return NULL;
+}
+
+static const AVClass *stream_group_child_iterate(void **opaque)
+{
+    uintptr_t i = (uintptr_t)*opaque;
+    const AVClass *ret = NULL;
+
+    switch(i) {
+    case AV_STREAM_GROUP_PARAMS_NONE:
+        i++;
+    // fall-through
+    case AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT:
+        ret = av_iamf_audio_element_get_class();
+        break;
+    case AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION:
+        ret = av_iamf_mix_presentation_get_class();
+        break;
+    default:
+        break;
+    }
+
+    if (ret)
+        *opaque = (void*)(i + 1);
+    return ret;
+}
+
+static const AVOption stream_group_options[] = {
+    DISPOSITION_OPT(AVStreamGroup),
+    {"id", "Set group id", offsetof(AVStreamGroup, id), AV_OPT_TYPE_INT64, {.i64 = 0}, 0, INT64_MAX, AV_OPT_FLAG_ENCODING_PARAM },
+    { NULL }
+};
+
+static const AVClass stream_group_class = {
+    .class_name     = "AVStreamGroup",
+    .item_name      = av_default_item_name,
+    .version        = LIBAVUTIL_VERSION_INT,
+    .option         = stream_group_options,
+    .child_next     = stream_group_child_next,
+    .child_class_iterate = stream_group_child_iterate,
+};
+
+const AVClass *av_stream_group_get_class(void)
+{
+    return &stream_group_class;
+}
+
+AVStreamGroup *avformat_stream_group_create(AVFormatContext *s,
+                                            enum AVStreamGroupParamsType type,
+                                            AVDictionary **options)
+{
+    AVStreamGroup **stream_groups;
+    AVStreamGroup *stg;
+    FFStreamGroup *stgi;
+
+    stream_groups = av_realloc_array(s->stream_groups, s->nb_stream_groups + 1,
+                                     sizeof(*stream_groups));
+    if (!stream_groups)
+        return NULL;
+    s->stream_groups = stream_groups;
+
+    stgi = av_mallocz(sizeof(*stgi));
+    if (!stgi)
+        return NULL;
+    stg = &stgi->pub;
+
+    stg->av_class = &stream_group_class;
+    av_opt_set_defaults(stg);
+    stg->type = type;
+    switch (type) {
+    case AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT:
+        stg->params.iamf_audio_element = av_iamf_audio_element_alloc();
+        if (!stg->params.iamf_audio_element)
+            goto fail;
+        break;
+    case AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION:
+        stg->params.iamf_mix_presentation = av_iamf_mix_presentation_alloc();
+        if (!stg->params.iamf_mix_presentation)
+            goto fail;
+        break;
+    default:
+        goto fail;
+    }
+
+    if (options) {
+        if (av_opt_set_dict2(stg, options, AV_OPT_SEARCH_CHILDREN))
+            goto fail;
+    }
+
+    stgi->fmtctx = s;
+    stg->index   = s->nb_stream_groups;
+
+    s->stream_groups[s->nb_stream_groups++] = stg;
+
+    return stg;
+fail:
+    ff_free_stream_group(&stg);
+    return NULL;
+}
+
+static int stream_group_add_stream(AVStreamGroup *stg, AVStream *st)
+{
+    AVStream **streams = av_realloc_array(stg->streams, stg->nb_streams + 1,
+                                          sizeof(*stg->streams));
+    if (!streams)
+        return AVERROR(ENOMEM);
+
+    stg->streams = streams;
+    stg->streams[stg->nb_streams++] = st;
+
+    return 0;
+}
+
+int avformat_stream_group_add_stream(AVStreamGroup *stg, AVStream *st)
+{
+    const FFStreamGroup *stgi = cffstreamgroup(stg);
+    const FFStream *sti = cffstream(st);
+
+    if (stgi->fmtctx != sti->fmtctx)
+        return AVERROR(EINVAL);
+
+    for (int i = 0; i < stg->nb_streams; i++)
+        if (stg->streams[i]->index == st->index)
+            return AVERROR(EEXIST);
+
+    return stream_group_add_stream(stg, st);
+}
+
+static int option_is_disposition(const AVOption *opt)
+{
+    return opt->type == AV_OPT_TYPE_CONST &&
+           opt->unit && !strcmp(opt->unit, "disposition");
+}
+
+int av_disposition_from_string(const char *disp)
+{
+    for (const AVOption *opt = stream_options; opt->name; opt++)
+        if (option_is_disposition(opt) && !strcmp(disp, opt->name))
+            return opt->default_val.i64;
+    return AVERROR(EINVAL);
+}
+
+const char *av_disposition_to_string(int disposition)
+{
+    int val;
+
+    if (disposition <= 0)
+        return NULL;
+
+    val = 1 << ff_ctz(disposition);
+    for (const AVOption *opt = stream_options; opt->name; opt++)
+        if (option_is_disposition(opt) && opt->default_val.i64 == val)
+            return opt->name;
+
+    return NULL;
 }

@@ -32,7 +32,7 @@
 #include "libavutil/timestamp.h"
 
 #include "avcodec.h"
-#include "internal.h"
+#include "decode.h"
 
 #include "mediacodec.h"
 #include "mediacodec_surface.h"
@@ -186,8 +186,7 @@ static void mediacodec_buffer_release(void *opaque, uint8_t *data)
         ff_AMediaCodec_releaseOutputBuffer(ctx->codec, buffer->index, 0);
     }
 
-    if (ctx->delay_flush)
-        ff_mediacodec_dec_unref(ctx);
+    ff_mediacodec_dec_unref(ctx);
     av_freep(&buffer);
 }
 
@@ -214,12 +213,11 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
     } else {
         frame->pts = info->presentationTimeUs;
     }
-#if FF_API_PKT_PTS
-FF_DISABLE_DEPRECATION_WARNINGS
-    frame->pkt_pts = frame->pts;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
     frame->pkt_dts = AV_NOPTS_VALUE;
+    frame->color_range = avctx->color_range;
+    frame->color_primaries = avctx->color_primaries;
+    frame->color_trc = avctx->color_trc;
+    frame->colorspace = avctx->colorspace;
 
     buffer = av_mallocz(sizeof(AVMediaCodecBuffer));
     if (!buffer) {
@@ -243,8 +241,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
     buffer->ctx = s;
     buffer->serial = atomic_load(&s->serial);
-    if (s->delay_flush)
-        ff_mediacodec_dec_ref(s);
+    ff_mediacodec_dec_ref(s);
 
     buffer->index = index;
     buffer->pts = info->presentationTimeUs;
@@ -258,8 +255,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
     return 0;
 fail:
-    av_freep(buffer);
-    av_buffer_unref(&frame->buf[0]);
+    av_freep(&buffer);
     status = ff_AMediaCodec_releaseOutputBuffer(s->codec, index, 0);
     if (status < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to release output buffer\n");
@@ -303,11 +299,6 @@ static int mediacodec_wrap_sw_buffer(AVCodecContext *avctx,
     } else {
         frame->pts = info->presentationTimeUs;
     }
-#if FF_API_PKT_PTS
-FF_DISABLE_DEPRECATION_WARNINGS
-    frame->pkt_pts = frame->pts;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
     frame->pkt_dts = AV_NOPTS_VALUE;
 
     av_log(avctx, AV_LOG_TRACE,
@@ -368,6 +359,9 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
     int ret = 0;
     int width = 0;
     int height = 0;
+    int color_range = 0;
+    int color_standard = 0;
+    int color_transfer = 0;
     char *format = NULL;
 
     if (!s->format) {
@@ -413,8 +407,24 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
     AMEDIAFORMAT_GET_INT32(s->crop_left,   "crop-left",   0);
     AMEDIAFORMAT_GET_INT32(s->crop_right,  "crop-right",  0);
 
-    width = s->crop_right + 1 - s->crop_left;
-    height = s->crop_bottom + 1 - s->crop_top;
+    // Try "crop" for NDK
+    if (!(s->crop_right && s->crop_bottom) && s->use_ndk_codec)
+        ff_AMediaFormat_getRect(s->format, "crop", &s->crop_left, &s->crop_top, &s->crop_right, &s->crop_bottom);
+
+    if (s->crop_right && s->crop_bottom) {
+        width = s->crop_right + 1 - s->crop_left;
+        height = s->crop_bottom + 1 - s->crop_top;
+    } else {
+        /* TODO: NDK MediaFormat should try getRect() first.
+         * Try crop-width/crop-height, it works on NVIDIA Shield.
+         */
+        AMEDIAFORMAT_GET_INT32(width,  "crop-width",  0);
+        AMEDIAFORMAT_GET_INT32(height, "crop-height", 0);
+    }
+    if (!width || !height) {
+        width = s->width;
+        height = s->height;
+    }
 
     AMEDIAFORMAT_GET_INT32(s->display_width,  "display-width",  0);
     AMEDIAFORMAT_GET_INT32(s->display_height, "display-height", 0);
@@ -425,6 +435,20 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
             (AVRational){ width, height });
         ff_set_sar(avctx, sar);
     }
+
+    AMEDIAFORMAT_GET_INT32(color_range, "color-range", 0);
+    if (color_range)
+        avctx->color_range = ff_AMediaFormatColorRange_to_AVColorRange(color_range);
+
+    AMEDIAFORMAT_GET_INT32(color_standard, "color-standard", 0);
+    if (color_standard) {
+        avctx->colorspace = ff_AMediaFormatColorStandard_to_AVColorSpace(color_standard);
+        avctx->color_primaries = ff_AMediaFormatColorStandard_to_AVColorPrimaries(color_standard);
+    }
+
+    AMEDIAFORMAT_GET_INT32(color_transfer, "color-transfer", 0);
+    if (color_transfer)
+        avctx->color_trc = ff_AMediaFormatColorTransfer_to_AVColorTransfer(color_transfer);
 
     av_log(avctx, AV_LOG_INFO,
         "Output crop parameters top=%d bottom=%d left=%d right=%d, "
@@ -490,14 +514,14 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
             if (device_ctx->type == AV_HWDEVICE_TYPE_MEDIACODEC) {
                 if (device_ctx->hwctx) {
                     AVMediaCodecDeviceContext *mediacodec_ctx = (AVMediaCodecDeviceContext *)device_ctx->hwctx;
-                    s->surface = ff_mediacodec_surface_ref(mediacodec_ctx->surface, avctx);
+                    s->surface = ff_mediacodec_surface_ref(mediacodec_ctx->surface, mediacodec_ctx->native_window, avctx);
                     av_log(avctx, AV_LOG_INFO, "Using surface %p\n", s->surface);
                 }
             }
         }
 
         if (!s->surface && user_ctx && user_ctx->surface) {
-            s->surface = ff_mediacodec_surface_ref(user_ctx->surface, avctx);
+            s->surface = ff_mediacodec_surface_ref(user_ctx->surface, NULL, avctx);
             av_log(avctx, AV_LOG_INFO, "Using surface %p\n", s->surface);
         }
     }
@@ -509,12 +533,27 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
 
     s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, avctx);
     if (!s->codec_name) {
-        ret = AVERROR_EXTERNAL;
-        goto fail;
+        // getCodecNameByType() can fail due to missing JVM, while NDK
+        // mediacodec can be used without JVM.
+        if (!s->use_ndk_codec) {
+            ret = AVERROR_EXTERNAL;
+            goto fail;
+        }
+        av_log(avctx, AV_LOG_INFO, "Failed to getCodecNameByType\n");
+    } else {
+        av_log(avctx, AV_LOG_DEBUG, "Found decoder %s\n", s->codec_name);
     }
 
-    av_log(avctx, AV_LOG_DEBUG, "Found decoder %s\n", s->codec_name);
-    s->codec = ff_AMediaCodec_createCodecByName(s->codec_name);
+    if (s->codec_name)
+        s->codec = ff_AMediaCodec_createCodecByName(s->codec_name, s->use_ndk_codec);
+    else {
+        s->codec = ff_AMediaCodec_createDecoderByType(mime, s->use_ndk_codec);
+        if (s->codec) {
+            s->codec_name = ff_AMediaCodec_getName(s->codec);
+            if (!s->codec_name)
+                s->codec_name = av_strdup(mime);
+        }
+    }
     if (!s->codec) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create media decoder for type %s and name %s\n", mime, s->codec_name);
         ret = AVERROR_EXTERNAL;
@@ -525,8 +564,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
     if (status < 0) {
         char *desc = ff_AMediaFormat_toString(format);
         av_log(avctx, AV_LOG_ERROR,
-            "Failed to configure codec (status = %d) with format %s\n",
-            status, desc);
+            "Failed to configure codec %s (status = %d) with format %s\n",
+            s->codec_name, status, desc);
         av_freep(&desc);
 
         ret = AVERROR_EXTERNAL;
@@ -537,8 +576,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
     if (status < 0) {
         char *desc = ff_AMediaFormat_toString(format);
         av_log(avctx, AV_LOG_ERROR,
-            "Failed to start codec (status = %d) with format %s\n",
-            status, desc);
+            "Failed to start codec %s (status = %d) with format %s\n",
+            s->codec_name, status, desc);
         av_freep(&desc);
         ret = AVERROR_EXTERNAL;
         goto fail;
@@ -569,7 +608,6 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
     int offset = 0;
     int need_draining = 0;
     uint8_t *data;
-    ssize_t index = s->current_input_buffer;
     size_t size;
     FFAMediaCodec *codec = s->codec;
     int status;
@@ -591,6 +629,7 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
     }
 
     while (offset < pkt->size || (need_draining && !s->draining)) {
+        ssize_t index = s->current_input_buffer;
         if (index < 0) {
             index = ff_AMediaCodec_dequeueInputBuffer(codec, input_dequeue_timeout_us);
             if (ff_AMediaCodec_infoTryAgainLater(codec, index)) {
@@ -612,7 +651,11 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
         }
 
         pts = pkt->pts;
-        if (pts != AV_NOPTS_VALUE && avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
+        if (pts == AV_NOPTS_VALUE) {
+            av_log(avctx, AV_LOG_WARNING, "Input packet is missing PTS\n");
+            pts = 0;
+        }
+        if (pts && avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
             pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
         }
 
@@ -628,24 +671,24 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
             }
 
             av_log(avctx, AV_LOG_TRACE,
-                   "Queued input buffer %zd size=%zd ts=%"PRIi64"\n", index, size, pts);
+                   "Queued empty EOS input buffer %zd with flags=%d\n", index, flags);
 
             s->draining = 1;
-            break;
-        } else {
-            size = FFMIN(pkt->size - offset, size);
-            memcpy(data, pkt->data + offset, size);
-            offset += size;
-
-            status = ff_AMediaCodec_queueInputBuffer(codec, index, 0, size, pts, 0);
-            if (status < 0) {
-                av_log(avctx, AV_LOG_ERROR, "Failed to queue input buffer (status = %d)\n", status);
-                return AVERROR_EXTERNAL;
-            }
-
-            av_log(avctx, AV_LOG_TRACE,
-                   "Queued input buffer %zd size=%zd ts=%"PRIi64"\n", index, size, pts);
+            return 0;
         }
+
+        size = FFMIN(pkt->size - offset, size);
+        memcpy(data, pkt->data + offset, size);
+        offset += size;
+
+        status = ff_AMediaCodec_queueInputBuffer(codec, index, 0, size, pts, 0);
+        if (status < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to queue input buffer (status = %d)\n", status);
+            return AVERROR_EXTERNAL;
+        }
+
+        av_log(avctx, AV_LOG_TRACE,
+               "Queued input buffer %zd size=%zd ts=%"PRIi64"\n", index, size, pts);
     }
 
     if (offset == 0)
@@ -761,6 +804,8 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
         return AVERROR_EXTERNAL;
     }
 
+    if (s->draining && s->eos)
+        return AVERROR_EOF;
     return AVERROR(EAGAIN);
 }
 
@@ -778,7 +823,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
 */
 int ff_mediacodec_dec_flush(AVCodecContext *avctx, MediaCodecDecContext *s)
 {
-    if (!s->surface || atomic_load(&s->refcount) == 1) {
+    if (!s->surface || !s->delay_flush || atomic_load(&s->refcount) == 1) {
         int ret;
 
         /* No frames (holding a reference to the codec) are retained by the

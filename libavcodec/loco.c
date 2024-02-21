@@ -25,9 +25,10 @@
  */
 
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
 #include "golomb.h"
-#include "internal.h"
 #include "mathops.h"
 
 enum LOCO_MODE {
@@ -82,12 +83,14 @@ static inline void loco_update_rice_param(RICEContext *r, int val)
 
 static inline int loco_get_rice(RICEContext *r)
 {
-    int v;
+    unsigned v;
     if (r->run > 0) { /* we have zero run */
         r->run--;
         loco_update_rice_param(r, 0);
         return 0;
     }
+    if (get_bits_left(&r->gb) < 1)
+        return INT_MIN;
     v = get_ur_golomb_jpegls(&r->gb, loco_get_rice_param(r), INT_MAX, 0);
     loco_update_rice_param(r, (v + 1) >> 1);
     if (!v) {
@@ -129,7 +132,7 @@ static int loco_decode_plane(LOCOContext *l, uint8_t *data, int width, int heigh
                              int stride, const uint8_t *buf, int buf_size)
 {
     RICEContext rc;
-    int val;
+    unsigned val;
     int ret;
     int i, j;
 
@@ -153,16 +156,22 @@ static int loco_decode_plane(LOCOContext *l, uint8_t *data, int width, int heigh
     /* restore top line */
     for (i = 1; i < width; i++) {
         val = loco_get_rice(&rc);
+        if (val == INT_MIN)
+           return AVERROR_INVALIDDATA;
         data[i] = data[i - 1] + val;
     }
     data += stride;
     for (j = 1; j < height; j++) {
         /* restore left column */
         val = loco_get_rice(&rc);
+        if (val == INT_MIN)
+           return AVERROR_INVALIDDATA;
         data[0] = data[-stride] + val;
         /* restore all other pixels */
         for (i = 1; i < width; i++) {
             val = loco_get_rice(&rc);
+            if (val == INT_MIN)
+                return -1;
             data[i] = loco_predict(&data[i], stride) + val;
         }
         data += stride;
@@ -187,19 +196,17 @@ static void rotate_faulty_loco(uint8_t *data, int width, int height, int stride)
     }
 }
 
-static int decode_frame(AVCodecContext *avctx,
-                        void *data, int *got_frame,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *p,
+                        int *got_frame, AVPacket *avpkt)
 {
     LOCOContext * const l = avctx->priv_data;
     const uint8_t *buf    = avpkt->data;
     int buf_size          = avpkt->size;
-    AVFrame * const p     = data;
     int decoded, ret;
 
     if ((ret = ff_get_buffer(avctx, p, 0)) < 0)
         return ret;
-    p->key_frame = 1;
+    p->flags |= AV_FRAME_FLAG_KEY;
 
 #define ADVANCE_BY_DECODED do { \
     if (decoded < 0 || decoded >= buf_size) goto buf_too_small; \
@@ -295,6 +302,11 @@ static av_cold int decode_init(AVCodecContext *avctx)
         avpriv_request_sample(avctx, "LOCO codec version %i", version);
     }
 
+    if (l->lossy > 65536U) {
+        av_log(avctx, AV_LOG_ERROR, "lossy %i is too large\n", l->lossy);
+        return AVERROR_INVALIDDATA;
+    }
+
     l->mode = AV_RL32(avctx->extradata + 4);
     switch (l->mode) {
     case LOCO_CYUY2:
@@ -324,13 +336,13 @@ static av_cold int decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_loco_decoder = {
-    .name           = "loco",
-    .long_name      = NULL_IF_CONFIG_SMALL("LOCO"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_LOCO,
+const FFCodec ff_loco_decoder = {
+    .p.name         = "loco",
+    CODEC_LONG_NAME("LOCO"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_LOCO,
     .priv_data_size = sizeof(LOCOContext),
     .init           = decode_init,
-    .decode         = decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

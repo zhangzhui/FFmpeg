@@ -23,8 +23,7 @@
 #include "avformat.h"
 #include "rawdec.h"
 
-#if CONFIG_MJPEG_2000_DEMUXER
-static int mjpeg2000_probe(AVProbeData *p)
+static int mjpeg2000_probe(const AVProbeData *p)
 {
     const uint8_t *b = p->buf;
     int i, marker, marker_size;
@@ -51,4 +50,3 @@ static int mjpeg2000_probe(AVProbeData *p)
     return 0;
 }
 FF_DEF_RAWVIDEO_DEMUXER2(mjpeg_2000, "raw MJPEG 2000 video", mjpeg2000_probe, "j2k", AV_CODEC_ID_JPEG2000, AVFMT_GENERIC_INDEX|AVFMT_NOTIMESTAMPS)
-#endif
