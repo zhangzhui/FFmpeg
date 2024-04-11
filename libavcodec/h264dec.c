@@ -32,6 +32,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/emms.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/thread.h"
 #include "libavutil/video_enc_params.h"
@@ -104,9 +105,17 @@ void ff_h264_draw_horiz_band(const H264Context *h, H264SliceContext *sl,
 {
     AVCodecContext *avctx = h->avctx;
     const AVFrame   *src  = h->cur_pic.f;
-    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(avctx->pix_fmt);
-    int vshift = desc->log2_chroma_h;
+    const AVPixFmtDescriptor *desc;
+    int offset[AV_NUM_DATA_POINTERS];
+    int vshift;
     const int field_pic = h->picture_structure != PICT_FRAME;
+
+    if (!avctx->draw_horiz_band)
+        return;
+
+    if (field_pic && h->first_field && !(avctx->slice_flags & SLICE_FLAG_ALLOW_FIELD))
+        return;
+
     if (field_pic) {
         height <<= 1;
         y      <<= 1;
@@ -114,24 +123,19 @@ void ff_h264_draw_horiz_band(const H264Context *h, H264SliceContext *sl,
 
     height = FFMIN(height, avctx->height - y);
 
-    if (field_pic && h->first_field && !(avctx->slice_flags & SLICE_FLAG_ALLOW_FIELD))
-        return;
+    desc   = av_pix_fmt_desc_get(avctx->pix_fmt);
+    vshift = desc->log2_chroma_h;
 
-    if (avctx->draw_horiz_band) {
-        int offset[AV_NUM_DATA_POINTERS];
-        int i;
+    offset[0] = y * src->linesize[0];
+    offset[1] =
+    offset[2] = (y >> vshift) * src->linesize[1];
+    for (int i = 3; i < AV_NUM_DATA_POINTERS; i++)
+        offset[i] = 0;
 
-        offset[0] = y * src->linesize[0];
-        offset[1] =
-        offset[2] = (y >> vshift) * src->linesize[1];
-        for (i = 3; i < AV_NUM_DATA_POINTERS; i++)
-            offset[i] = 0;
+    emms_c();
 
-        emms_c();
-
-        avctx->draw_horiz_band(avctx, src, offset,
-                               y, h->picture_structure, height);
-    }
+    avctx->draw_horiz_band(avctx, src, offset,
+                           y, h->picture_structure, height);
 }
 
 void ff_h264_free_tables(H264Context *h)

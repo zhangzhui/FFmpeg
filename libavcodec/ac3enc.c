@@ -35,6 +35,7 @@
 #include "libavutil/crc.h"
 #include "libavutil/emms.h"
 #include "libavutil/internal.h"
+#include "libavutil/mem.h"
 #include "libavutil/mem_internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/thread.h"
@@ -150,30 +151,6 @@ static uint8_t exponent_group_tab[2][3][256];
 /**
  * List of supported channel layouts.
  */
-#if FF_API_OLD_CHANNEL_LAYOUT
-const uint64_t ff_ac3_channel_layouts[19] = {
-     AV_CH_LAYOUT_MONO,
-     AV_CH_LAYOUT_STEREO,
-     AV_CH_LAYOUT_2_1,
-     AV_CH_LAYOUT_SURROUND,
-     AV_CH_LAYOUT_2_2,
-     AV_CH_LAYOUT_QUAD,
-     AV_CH_LAYOUT_4POINT0,
-     AV_CH_LAYOUT_5POINT0,
-     AV_CH_LAYOUT_5POINT0_BACK,
-    (AV_CH_LAYOUT_MONO     | AV_CH_LOW_FREQUENCY),
-    (AV_CH_LAYOUT_STEREO   | AV_CH_LOW_FREQUENCY),
-    (AV_CH_LAYOUT_2_1      | AV_CH_LOW_FREQUENCY),
-    (AV_CH_LAYOUT_SURROUND | AV_CH_LOW_FREQUENCY),
-    (AV_CH_LAYOUT_2_2      | AV_CH_LOW_FREQUENCY),
-    (AV_CH_LAYOUT_QUAD     | AV_CH_LOW_FREQUENCY),
-    (AV_CH_LAYOUT_4POINT0  | AV_CH_LOW_FREQUENCY),
-     AV_CH_LAYOUT_5POINT1,
-     AV_CH_LAYOUT_5POINT1_BACK,
-     0
-};
-#endif
-
 const AVChannelLayout ff_ac3_ch_layouts[19] = {
     AV_CHANNEL_LAYOUT_MONO,
     AV_CHANNEL_LAYOUT_STEREO,
