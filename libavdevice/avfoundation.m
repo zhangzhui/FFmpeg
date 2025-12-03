@@ -150,7 +150,7 @@ static void unlock_frames(AVFContext* ctx)
     pthread_mutex_unlock(&ctx->frame_lock);
 }
 
-/** FrameReciever class - delegate for AVCaptureSession
+/** FrameReceiver class - delegate for AVCaptureSession
  */
 @interface AVFFrameReceiver : NSObject
 {
@@ -242,7 +242,7 @@ static void unlock_frames(AVFContext* ctx)
 
 @end
 
-/** AudioReciever class - delegate for AVCaptureSession
+/** AudioReceiver class - delegate for AVCaptureSession
  */
 @interface AVFAudioReceiver : NSObject
 {
@@ -632,7 +632,6 @@ static int get_video_config(AVFormatContext *s)
 {
     AVFContext *ctx = (AVFContext*)s->priv_data;
     CVImageBufferRef image_buffer;
-    CMBlockBufferRef block_buffer;
     CGSize image_buffer_size;
     AVStream* stream = avformat_new_stream(s, NULL);
 
@@ -652,7 +651,6 @@ static int get_video_config(AVFormatContext *s)
     avpriv_set_pts_info(stream, 64, 1, avf_time_base);
 
     image_buffer = CMSampleBufferGetImageBuffer(ctx->current_frame);
-    block_buffer = CMSampleBufferGetDataBuffer(ctx->current_frame);
 
     if (image_buffer) {
         image_buffer_size = CVImageBufferGetEncodedSize(image_buffer);
@@ -788,6 +786,9 @@ static NSArray* getDevicesWithMediaType(AVMediaType mediaType) {
         #endif
         #if (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MIN_REQUIRED >= 170000 || (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED >= 140000))
             [deviceTypes addObject: AVCaptureDeviceTypeContinuityCamera];
+            [deviceTypes addObject: AVCaptureDeviceTypeExternal];
+        #elif (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED < 140000)
+            [deviceTypes addObject: AVCaptureDeviceTypeExternalUnknown];
         #endif
     } else if (mediaType == AVMediaTypeAudio) {
         #if (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MIN_REQUIRED >= 170000 || (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED >= 140000))
@@ -813,8 +814,10 @@ static NSArray* getDevicesWithMediaType(AVMediaType mediaType) {
                               mediaType:mediaType
                                position:AVCaptureDevicePositionUnspecified];
     return [captureDeviceDiscoverySession devices];
-#else
+#elif TARGET_OS_OSX
     return [AVCaptureDevice devicesWithMediaType:mediaType];
+#else
+    return nil;
 #endif
 }
 

@@ -36,6 +36,12 @@
 typedef struct MuxStream {
     OutputStream    ost;
 
+    /**
+     * Codec parameters for packets submitted to the muxer (i.e. before
+     * bitstream filtering, if any).
+     */
+    AVCodecParameters *par_in;
+
     // name used for logging
     char            log_name[32];
 
@@ -79,7 +85,11 @@ typedef struct MuxStream {
     int             ts_drop;
 #endif
 
-    char           *apad;
+    AVRational      frame_rate;
+    AVRational      max_frame_rate;
+    int             force_fps;
+
+    const char     *apad;
 } MuxStream;
 
 typedef struct Muxer {
@@ -99,6 +109,9 @@ typedef struct Muxer {
 
     AVDictionary           *opts;
 
+    // used to validate that all encoder avoptions have been actually used
+    AVDictionary           *enc_opts_used;
+
     /* filesize limit expressed in bytes */
     int64_t                 limit_filesize;
     atomic_int_least64_t    last_filesize;
@@ -110,7 +123,7 @@ typedef struct Muxer {
 
 int mux_check_init(void *arg);
 
-static MuxStream *ms_from_ost(OutputStream *ost)
+static inline MuxStream *ms_from_ost(OutputStream *ost)
 {
     return (MuxStream*)ost;
 }

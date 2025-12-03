@@ -23,6 +23,7 @@
 #include "avs2.h"
 #include "get_bits.h"
 #include "parser.h"
+#include "parser_internal.h"
 
 static int avs2_find_frame_end(ParseContext *pc, const uint8_t *buf, int buf_size)
 {
@@ -72,13 +73,15 @@ static void parse_avs2_seq_header(AVCodecParserContext *s, const uint8_t *buf,
     unsigned aspect_ratio;
     unsigned frame_rate_code;
     int low_delay;
+    av_unused int ret;
     // update buf_size_min if parse more deeper
     const int buf_size_min = 15;
 
     if (buf_size < buf_size_min)
         return;
 
-    init_get_bits8(&gb, buf, buf_size_min);
+    ret = init_get_bits8(&gb, buf, buf_size_min);
+    av_assert1(ret >= 0);
 
     s->key_frame = 1;
     s->pict_type = AV_PICTURE_TYPE_I;
@@ -187,9 +190,9 @@ static int avs2_parse(AVCodecParserContext *s, AVCodecContext *avctx,
     return next;
 }
 
-const AVCodecParser ff_avs2_parser = {
-    .codec_ids      = { AV_CODEC_ID_AVS2 },
+const FFCodecParser ff_avs2_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_AVS2),
     .priv_data_size = sizeof(ParseContext),
-    .parser_parse   = avs2_parse,
-    .parser_close   = ff_parse_close,
+    .parse          = avs2_parse,
+    .close          = ff_parse_close,
 };

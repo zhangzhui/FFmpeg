@@ -28,6 +28,7 @@ HTMLPAGES   = $(AVPROGS-yes:%=doc/%.html) $(AVPROGS-yes:%=doc/%-all.html) $(COMP
               doc/mailing-list-faq.html                                 \
               doc/nut.html                                              \
               doc/platform.html                                         \
+              doc/drawvg-reference.html                                 \
               $(SRC_PATH)/doc/bootstrap.min.css                         \
               $(SRC_PATH)/doc/style.min.css                             \
               $(SRC_PATH)/doc/default.css                               \
@@ -60,7 +61,7 @@ GENTEXI := $(GENTEXI:%=doc/avoptions_%.texi)
 
 $(GENTEXI): TAG = GENTEXI
 $(GENTEXI): doc/avoptions_%.texi: doc/print_options$(HOSTEXESUF)
-	$(M)doc/print_options $* > $@
+	$(M)doc/print_options$(HOSTEXESUF) $* > $@
 
 doc/%.html: TAG = HTML
 doc/%-all.html: TAG = HTML

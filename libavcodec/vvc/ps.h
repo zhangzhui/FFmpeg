@@ -69,7 +69,7 @@ typedef struct VVCSPS {
     uint8_t     bit_depth;                                          ///< BitDepth
     uint8_t     qp_bd_offset;                                       ///< QpBdOffset
     uint8_t     ctb_log2_size_y;                                    ///< CtbLog2SizeY
-    uint8_t     ctb_size_y;                                         ///< CtbSizeY
+    uint16_t    ctb_size_y;                                         ///< CtbSizeY
     uint8_t     min_cb_log2_size_y;                                 ///< MinCbLog2SizeY
     uint8_t     min_cb_size_y;                                      ///< MinCbSizeY
     uint8_t     max_tb_size_y;                                      ///< MaxTbSizeY
@@ -151,6 +151,12 @@ typedef struct VVCPH {
     //derived values
     uint32_t max_num_subblock_merge_cand;           ///< MaxNumSubblockMergeCand
     int32_t  poc;                                   ///< PicOrderCntVal
+
+    uint8_t  num_ver_vbs;                           ///< NumVerVirtualBoundaries
+    uint16_t vb_pos_x[VVC_MAX_VBS];                 ///< VirtualBoundaryPosX
+    uint8_t  num_hor_vbs;                           ///< NumHorVirtualBoundaries
+    uint16_t vb_pos_y[VVC_MAX_VBS];                 ///< VirtualBoundaryPosY
+
     PredWeightTable pwt;
 } VVCPH;
 
@@ -163,6 +169,7 @@ typedef struct VVCPH {
 #define ALF_NUM_COEFF_CC         7
 
 typedef struct VVCALF {
+    const H266RawAPS *r;
     int16_t luma_coeff     [ALF_NUM_FILTERS_LUMA][ALF_NUM_COEFF_LUMA];
     uint8_t luma_clip_idx  [ALF_NUM_FILTERS_LUMA][ALF_NUM_COEFF_LUMA];
 
@@ -259,8 +266,9 @@ typedef struct VVCSH {
 } VVCSH;
 
 struct VVCContext;
+struct VVCFrameContext;
 
-int ff_vvc_decode_frame_ps(VVCFrameParamSets *fps, struct VVCContext *s);
+int ff_vvc_decode_frame_ps(struct VVCFrameContext *fc, struct VVCContext *s);
 int ff_vvc_decode_aps(VVCParamSets *ps, const CodedBitstreamUnit *unit);
 int ff_vvc_decode_sh(VVCSH *sh, const VVCFrameParamSets *ps, const CodedBitstreamUnit *unit);
 void ff_vvc_frame_ps_free(VVCFrameParamSets *fps);

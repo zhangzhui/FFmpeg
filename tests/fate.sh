@@ -30,14 +30,14 @@ lock(){
 checkout(){
     case "$repo" in
         file:*|/*) src="${repo#file:}"      ;;
-        git:*)     git clone --quiet --branch "$branch" "$repo" "$src" ;;
+        git:*|https:*) git clone --quiet --branch "$branch" "$repo" "$src" ;;
     esac
 }
 
 update()(
     cd ${src} || return
     case "$repo" in
-        git:*) git fetch --quiet --force && git reset --quiet --hard "origin/$branch" ;;
+        git:*|https:*) git fetch --quiet --force && git reset --quiet --hard "origin/$branch" ;;
     esac
 )
 
@@ -55,13 +55,17 @@ configure()(
         ${cross_prefix:+--cross-prefix="$cross_prefix"}                 \
         ${as:+--as="$as"}                                               \
         ${cc:+--cc="$cc"}                                               \
+        ${cxx:+--cxx="$cxx"}                                            \
         ${ld:+--ld="$ld"}                                               \
+        ${nm:+--nm="$nm"}                                               \
         ${target_os:+--target-os="$target_os"}                          \
         ${sysroot:+--sysroot="$sysroot"}                                \
         ${target_exec:+--target-exec="$target_exec"}                    \
         ${target_path:+--target-path="$target_path"}                    \
         ${target_samples:+--target-samples="$target_samples"}           \
         ${extra_cflags:+--extra-cflags="$extra_cflags"}                 \
+        ${extra_cxxflags:+--extra-cxxflags="$extra_cxxflags"}           \
+        ${extra_objcflags:+--extra-objcflags="$extra_objcflags"}        \
         ${extra_ldflags:+--extra-ldflags="$extra_ldflags"}              \
         ${extra_libs:+--extra-libs="$extra_libs"}                       \
         ${extra_conf}
@@ -91,7 +95,7 @@ fate()(
 )
 
 clean(){
-    rm -rf ${build} ${inst}
+    test "$skip_clean" = "yes" || rm -rf ${build} ${inst}
 }
 
 report(){

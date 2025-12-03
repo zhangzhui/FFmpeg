@@ -49,7 +49,7 @@ static const uint8_t ty_AC3AudioPacket[]  = { 0x00, 0x00, 0x01, 0xbd };
 #define CHUNK_PEEK_COUNT  3      /* number of chunks to probe */
 
 typedef struct TyRecHdr {
-    int64_t   rec_size;
+    int32_t   rec_size;
     uint8_t   ex[2];
     uint8_t   rec_type;
     uint8_t   subrec_type;
@@ -303,7 +303,7 @@ static int ty_read_header(AVFormatContext *s)
     if (ty->tivo_series == TIVO_SERIES_UNKNOWN ||
         ty->audio_type == TIVO_AUDIO_UNKNOWN ||
         ty->tivo_type == TIVO_TYPE_UNKNOWN)
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
 
     st = avformat_new_stream(s, NULL);
     if (!st)

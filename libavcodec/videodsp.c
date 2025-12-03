@@ -51,7 +51,9 @@ av_cold void ff_videodsp_init(VideoDSPContext *ctx, int bpc)
     ff_videodsp_init_arm(ctx, bpc);
 #elif ARCH_PPC
     ff_videodsp_init_ppc(ctx, bpc);
-#elif ARCH_X86
+#elif ARCH_RISCV
+    ff_videodsp_init_riscv(ctx, bpc);
+#elif ARCH_X86 && HAVE_X86ASM
     ff_videodsp_init_x86(ctx, bpc);
 #elif ARCH_MIPS
     ff_videodsp_init_mips(ctx, bpc);

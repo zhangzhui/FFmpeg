@@ -333,7 +333,7 @@ static int dnxhd_decode_header(DNXHDContext *ctx, AVFrame *frame,
 
     if (ctx->mb_height > FF_ARRAY_ELEMS(ctx->mb_scan_index)) {
         av_log(ctx->avctx, AV_LOG_ERROR,
-               "mb_height too big (%d > %"SIZE_SPECIFIER").\n", ctx->mb_height, FF_ARRAY_ELEMS(ctx->mb_scan_index));
+               "mb_height too big (%d > %zu).\n", ctx->mb_height, FF_ARRAY_ELEMS(ctx->mb_scan_index));
         return AVERROR_INVALIDDATA;
     }
 
@@ -655,8 +655,6 @@ decode_coding_unit:
     if (first_field) {
         if ((ret = ff_thread_get_buffer(avctx, picture, 0)) < 0)
             return ret;
-        picture->pict_type = AV_PICTURE_TYPE_I;
-        picture->flags |= AV_FRAME_FLAG_KEY;
     }
 
     ctx->buf_size = buf_size - ctx->data_offset;

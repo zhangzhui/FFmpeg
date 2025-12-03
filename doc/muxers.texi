@@ -319,7 +319,7 @@ This is the same as the @samp{vob} muxer with a few differences.
 @table @option
 @item muxrate @var{rate}
 Set user-defined mux rate expressed as a number of bits/s. If not
-specied the automatically computed mux rate is employed. Default value
+specified the automatically computed mux rate is employed. Default value
 is @code{0}.
 
 @item preload @var{delay}
@@ -569,6 +569,17 @@ experimental, may be renamed or changed, do not use from scripts.
 
 @item write_gama
 write deprecated gama atom
+
+@item hybrid_fragmented
+For recoverability - write the output file as a fragmented file.
+This allows the intermediate file to be read while being written
+(in particular, if the writing process is aborted uncleanly). When
+writing is finished, the file is converted to a regular, non-fragmented
+file, which is more compatible and allows easier and quicker seeking.
+
+If writing is aborted, the intermediate file can manually be
+remuxed to get a regular, non-fragmented file of what had been
+written into the unfinished file.
 @end table
 
 @item movie_timescale @var{scale}
@@ -761,7 +772,7 @@ Force a delay expressed in seconds after the last frame of each
 repetition. Default value is @code{0.0}.
 
 @item plays @var{repetitions}
-specify how many times to play the content, @code{0} causes an infinte
+specify how many times to play the content, @code{0} causes an infinite
 loop, with @code{1} there is no loop
 @end table
 
@@ -1759,7 +1770,7 @@ for looping indefinitely (default).
 @item final_delay @var{delay}
 Force the delay (expressed in centiseconds) after the last frame. Each frame
 ends with a delay until the next frame. The default is @code{-1}, which is a
-special value to tell the muxer to re-use the previous delay. In case of a
+special value to tell the muxer to reuse the previous delay. In case of a
 loop, you might want to customize this value to mark a pause for instance.
 @end table
 
@@ -1845,7 +1856,7 @@ This muxer creates an .f4m (Adobe Flash Media Manifest File) manifest, an .abst
 (Adobe Bootstrap File) for each stream, and segment files in a directory
 specified as the output.
 
-These needs to be accessed by an HDS player throuhg HTTPS for it to be able to
+These needs to be accessed by an HDS player through HTTPS for it to be able to
 perform playback on the generated stream.
 
 @subsection Options
@@ -2425,13 +2436,14 @@ ffmpeg -re -i in.ts -b:a:0 32k -b:a:1 64k -b:v:0 1000k \
 @item
 Create a single variant stream. Add the @code{#EXT-X-MEDIA} tag with
 @code{TYPE=SUBTITLES} in the master playlist with webvtt subtitle group name
-'subtitle'. Make sure the input file has one text subtitle stream at least.
+'subtitle' and optional subtitle name, e.g. 'English'. Make sure the input
+file has one text subtitle stream at least.
 @example
 ffmpeg -y -i input_with_subtitle.mkv \
  -b:v:0 5250k -c:v h264 -pix_fmt yuv420p -profile:v main -level 4.1 \
  -b:a:0 256k \
  -c:s webvtt -c:a mp2 -ar 48000 -ac 2 -map 0:v -map 0:a:0 -map 0:s:0 \
- -f hls -var_stream_map "v:0,a:0,s:0,sgroup:subtitle" \
+ -f hls -var_stream_map "v:0,a:0,s:0,sgroup:subtitle,sname:English" \
  -master_pl_name master.m3u8 -t 300 -hls_time 10 -hls_init_time 4 -hls_list_size \
  10 -master_pl_publish_rate 10 -hls_flags \
  delete_segments+discont_start+split_by_time ./tmp/video.m3u8
@@ -2526,7 +2538,7 @@ these applications, audio may be played back on a wide range of devices, e.g.,
 headphones, mobile phones, tablets, TVs, sound bars, home theater systems, and
 big screens.
 
-This format was promoted and desgined by Alliance for Open Media.
+This format was promoted and designed by Alliance for Open Media.
 
 For more information about this format, see @url{https://aomedia.org/iamf/}.
 
@@ -2725,6 +2737,12 @@ games such as "Real War", and "Real War: Rogue States".
 
 This muxer accepts a single @samp{adpcm_ima_ssi} audio stream.
 
+@section lc3
+Bluetooth SIG Low Complexity Communication Codec audio (LC3), or
+ETSI TS 103 634 Low Complexity Communication Codec plus (LC3plus).
+
+This muxer accepts a single @samp{lc3} audio stream.
+
 @section lrc
 LRC lyrics file format muxer.
 
@@ -2816,14 +2834,14 @@ ffmpeg -i sample_left_right_clip.mpg -an -c:v libvpx -metadata stereo_mode=left_
 
 @subsection Options
 @table @option
-@item reserve_index_space @var{index}
+@item reserve_index_space @var{size}
 By default, this muxer writes the index for seeking (called cues in Matroska
 terms) at the end of the file, because it cannot know in advance how much space
 to leave for the index at the beginning of the file. However for some use cases
 -- e.g.  streaming where seeking is possible but slow -- it is useful to put the
 index at the beginning of the file.
 
-If this option is set to a non-zero value, the muxer will reserve a given amount
+If this option is set to a non-zero value, the muxer will reserve @var{size} bytes
 of space in the file header and then try to write the cues there when the muxing
 finishes. If the reserved space does not suffice, no Cues will be written, the
 file will be finalized and writing the trailer will return an error.
@@ -2840,8 +2858,44 @@ the initially reserved space turns out to be insufficient.
 
 This option is ignored if the output is unseekable.
 
+@item cluster_size_limit @var{size}
+Store at most the provided amount of bytes in a cluster.
+
+If not specified, the limit is set automatically to a sensible
+hardcoded fixed value.
+
+@item cluster_time_limit @var{duration}
+Store at most the provided number of milliseconds in a cluster.
+
+If not specified, the limit is set automatically to a sensible
+hardcoded fixed value.
+
+@item dash @var{bool}
+Create a WebM file conforming to WebM DASH specification. By default
+it is set to @code{false}.
+
+@item dash_track_number @var{index}
+Track number for the DASH stream. By default it is set to @code{1}.
+
+@item live @var{bool}
+Write files assuming it is a live stream. By default it is set to
+@code{false}.
+
+@item allow_raw_vfw @var{bool}
+Allow raw VFW mode. By default it is set to @code{false}.
+
+@item flipped_raw_rgb @var{bool}
+If set to @code{true}, store positive height for raw RGB bitmaps, which indicates
+bitmap is stored bottom-up. Note that this option does not flip the bitmap
+which has to be done manually beforehand, e.g. by using the @samp{vflip} filter.
+Default is @code{false} and indicates bitmap is stored top down.
+
+@item write_crc32 @var{bool}
+Write a CRC32 element inside every Level 1 element. By default it is
+set to @code{true}. This option is ignored for WebM.
+
 @item default_mode @var{mode}
-This option controls how the FlagDefault of the output tracks will be set.
+Control how the FlagDefault of the output tracks will be set.
 It influences which tracks players should play by default. The default mode
 is @samp{passthrough}.
 @table @samp
@@ -2859,36 +2913,84 @@ disposition default exists, no subtitle track will be marked as default.
 In this mode the FlagDefault is set if and only if the AV_DISPOSITION_DEFAULT
 flag is set in the disposition of the corresponding stream.
 @end table
-
-@item flipped_raw_rgb @var{bool}
-If set to true, store positive height for raw RGB bitmaps, which indicates
-bitmap is stored bottom-up. Note that this option does not flip the bitmap
-which has to be done manually beforehand, e.g. by using the vflip filter.
-Default is @var{false} and indicates bitmap is stored top down.
 @end table
 
 @anchor{md5}
 @section md5
-
 MD5 testing format.
 
 This is a variant of the @ref{hash} muxer. Unlike that muxer, it
 defaults to using the MD5 hash function.
 
-@subsection Examples
+See also the @ref{hash} and @ref{framemd5} muxers.
 
+@subsection Examples
+@itemize
+@item
 To compute the MD5 hash of the input converted to raw
 audio and video, and store it in the file @file{out.md5}:
 @example
 ffmpeg -i INPUT -f md5 out.md5
 @end example
 
-You can print the MD5 to stdout with the command:
+@item
+To print the MD5 hash to stdout:
 @example
 ffmpeg -i INPUT -f md5 -
 @end example
+@end itemize
 
-See also the @ref{hash} and @ref{framemd5} muxers.
+@anchor{mccenc}
+@section mcc
+Muxer for MacCaption MCC files, it supports MCC versions 1.0 and 2.0.
+MCC files store VANC data, which can include closed captions (EIA-608 and CEA-708), ancillary time code, pan-scan data, etc.
+
+@subsection Options
+
+The muxer options are:
+
+@table @option
+@item override_time_code_rate
+Override the @code{Time Code Rate} value in the output. Defaults to trying to deduce from the stream's @code{time_base}, which often doesn't work.
+@item use_u_alias
+Use the @code{U} alias for the byte sequence @code{E1h 00h 00h 00h}.
+Disabled by default because some @file{.mcc} files disagree on whether it has 2 or 3 zero bytes.
+@item mcc_version
+The MCC file format version. Must be either 1 or 2, defaults to 2.
+@item creation_program
+The creation program. Defaults to this version of FFmpeg.
+@item creation_time
+The creation time. Defaults to the current time.
+@end table
+
+@subsection Examples
+@itemize
+@item
+Extract a MXF @code{SMPTE_436M_ANC} stream from a MXF file and write it to a MCC file at 30 fps.
+@example
+ffmpeg -i input.mxf -c copy -map 0:d -override_time_code_rate 30 out.mcc
+@end example
+
+@item
+Extract EIA-608/CTA-708 closed captions from a @file{.mp4} file and write them to a MCC file at 29.97 fps.
+@example
+ffmpeg -f lavfi -i "movie=input.mp4[out+subcc]" -c:s copy -map 0:s -override_time_code_rate 30000/1001 out.mcc
+@end example
+@end itemize
+
+@section microdvd
+MicroDVD subtitle format muxer.
+
+This muxer accepts a single @samp{microdvd} subtitles stream.
+
+@section mmf
+Synthetic music Mobile Application Format (SMAF) format muxer.
+
+SMAF is a music data format specified by Yamaha for portable
+electronic devices, such as mobile phones and personal digital
+assistants.
+
+This muxer accepts a single @samp{adpcm_yamaha} audio stream.
 
 @section mp3
 
@@ -3814,5 +3916,66 @@ ffmpeg -f webm_dash_manifest -i video1.webm \
        -adaptation_sets "id=0,streams=0,1 id=1,streams=2,3" \
        manifest.xml
 @end example
+
+@anchor{whip}
+@section whip
+
+WebRTC (Real-Time Communication) muxer that supports sub-second latency streaming according to
+the WHIP (WebRTC-HTTP ingestion protocol) specification.
+
+This is an experimental feature.
+
+It uses HTTP as a signaling protocol to exchange SDP capabilities and ICE lite candidates. Then,
+it uses STUN binding requests and responses to establish a session over UDP. Subsequently, it
+initiates a DTLS handshake to exchange the SRTP encryption keys. Lastly, it splits video and
+audio frames into RTP packets and encrypts them using SRTP.
+
+Ensure that you use H.264 without B frames and Opus for the audio codec. For example, to convert
+an input file with @command{ffmpeg} to WebRTC:
+@example
+ffmpeg -re -i input.mp4 -acodec libopus -ar 48000 -ac 2 \
+  -vcodec libx264 -profile:v baseline -tune zerolatency -threads 1 -bf 0 \
+  -f whip "http://localhost:1985/rtc/v1/whip/?app=live&stream=livestream"
+@end example
+
+For this example, we have employed low latency options, resulting in an end-to-end latency of
+approximately 150ms.
+
+@subsection Options
+
+This muxer supports the following options:
+
+@table @option
+
+@item handshake_timeout @var{integer}
+Set the timeout in milliseconds for ICE and DTLS handshake.
+Default value is 5000.
+
+@item pkt_size @var{integer}
+Set the maximum size, in bytes, of RTP packets that send out.
+Default value is 1200.
+
+@item buffer_size @var{integer}
+Set the buffer size, in bytes, of underlying protocol.
+Default value is -1(auto). The UDP auto selects a reasonable value.
+
+@item whip_flags @var{flags}
+Possible values:
+
+@table @samp
+@item dtls_active
+The muxer will try to set dtls active role and send the first client hello.
+@end table
+
+@item authorization @var{string}
+The optional Bearer token for WHIP Authorization.
+
+@item cert_file @var{string}
+The optional certificate file path for DTLS.
+
+@item key_file @var{string}
+The optional private key file path for DTLS.
+
+@end table
 
 @c man end MUXERS

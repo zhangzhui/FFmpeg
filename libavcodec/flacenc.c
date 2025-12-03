@@ -525,11 +525,10 @@ static void copy_samples(FlacEncodeContext *s, const void *samples)
 {
     int i, j, ch;
     FlacFrame *frame;
-    int shift = av_get_bytes_per_sample(s->avctx->sample_fmt) * 8 -
-                s->avctx->bits_per_raw_sample;
 
-#define COPY_SAMPLES(bits) do {                                     \
+#define COPY_SAMPLES(bits, shift0) do {                             \
     const int ## bits ## _t *samples0 = samples;                    \
+    const int shift = shift0;                                       \
     frame = &s->frame;                                              \
     for (i = 0, j = 0; i < frame->blocksize; i++)                   \
         for (ch = 0; ch < s->channels; ch++, j++)                   \
@@ -537,9 +536,9 @@ static void copy_samples(FlacEncodeContext *s, const void *samples)
 } while (0)
 
     if (s->avctx->sample_fmt == AV_SAMPLE_FMT_S16)
-        COPY_SAMPLES(16);
+        COPY_SAMPLES(16, 0);
     else
-        COPY_SAMPLES(32);
+        COPY_SAMPLES(32, 32 - s->avctx->bits_per_raw_sample);
 }
 
 
@@ -1173,7 +1172,7 @@ static int encode_residual_ch(FlacEncodeContext *s, int ch)
 
 static int count_frame_header(FlacEncodeContext *s)
 {
-    uint8_t av_unused tmp;
+    av_unused uint8_t tmp;
     int count;
 
     /*
@@ -1761,9 +1760,7 @@ const FFCodec ff_flac_encoder = {
     .init           = flac_encode_init,
     FF_CODEC_ENCODE_CB(flac_encode_frame),
     .close          = flac_encode_close,
-    .p.sample_fmts  = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,
-                                                     AV_SAMPLE_FMT_S32,
-                                                     AV_SAMPLE_FMT_NONE },
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S32),
     .p.priv_class   = &flac_encoder_class,
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP | FF_CODEC_CAP_EOF_FLUSH,
 };

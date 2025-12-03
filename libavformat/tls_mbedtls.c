@@ -26,6 +26,10 @@
 #include <mbedtls/platform.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/x509_crt.h>
+#include <mbedtls/debug.h>
+#ifdef MBEDTLS_PSA_CRYPTO_C
+#include <psa/crypto.h>
+#endif
 
 #include "avformat.h"
 #include "internal.h"
@@ -33,9 +37,9 @@
 #include "tls.h"
 #include "libavutil/mem.h"
 #include "libavutil/parseutils.h"
+#include "libavutil/avstring.h"
 
 typedef struct TLSContext {
-    const AVClass *class;
     TLSShared tls_shared;
     mbedtls_ssl_context ssl_context;
     mbedtls_ssl_config ssl_config;
@@ -109,6 +113,13 @@ static int mbedtls_recv(void *ctx, unsigned char *buf, size_t len)
     return handle_transport_error(h, "ffurl_read", MBEDTLS_ERR_SSL_WANT_READ, ret);
 }
 
+static void mbedtls_debug(void *ctx, int lvl, const char *file, int line, const char *msg)
+{
+    URLContext *h = (URLContext*) ctx;
+    int av_lvl = lvl >= 4 ? AV_LOG_TRACE : AV_LOG_DEBUG;
+    av_log(h, av_lvl, "%s:%d: %s", av_basename(file), line, msg);
+}
+
 static void handle_pk_parse_error(URLContext *h, int ret)
 {
     switch (ret) {
@@ -138,6 +149,9 @@ static void handle_handshake_error(URLContext *h, int ret)
     case MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE:
         av_log(h, AV_LOG_ERROR, "TLS handshake failed.\n");
         break;
+    case MBEDTLS_ERR_SSL_BAD_PROTOCOL_VERSION:
+        av_log(h, AV_LOG_ERROR, "TLS protocol version mismatch.\n");
+        break;
 #endif
     case MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE:
         av_log(h, AV_LOG_ERROR, "A fatal alert message was received from the peer, has the peer a correct certificate?\n");
@@ -145,24 +159,19 @@ static void handle_handshake_error(URLContext *h, int ret)
     case MBEDTLS_ERR_SSL_CA_CHAIN_REQUIRED:
         av_log(h, AV_LOG_ERROR, "No CA chain is set, but required to operate. Was the CA correctly set?\n");
         break;
+    case MBEDTLS_ERR_SSL_INTERNAL_ERROR:
+        av_log(h, AV_LOG_ERROR, "Internal error encountered.\n");
+        break;
     case MBEDTLS_ERR_NET_CONN_RESET:
         av_log(h, AV_LOG_ERROR, "TLS handshake was aborted by peer.\n");
+        break;
+    case MBEDTLS_ERR_X509_CERT_VERIFY_FAILED:
+        av_log(h, AV_LOG_ERROR, "Certificate verification failed.\n");
         break;
     default:
         av_log(h, AV_LOG_ERROR, "mbedtls_ssl_handshake returned -0x%x\n", -ret);
         break;
     }
-}
-
-static void parse_options(TLSContext *tls_ctxc, const char *uri)
-{
-    char buf[1024];
-    const char *p = strchr(uri, '?');
-    if (!p)
-        return;
-
-    if (!tls_ctxc->priv_key_pw && av_find_info_tag(buf, sizeof(buf), "key_password", p))
-        tls_ctxc->priv_key_pw = av_strdup(buf);
 }
 
 static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **options)
@@ -172,11 +181,15 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     uint32_t verify_res_flags;
     int ret;
 
-    // parse additional options
-    parse_options(tls_ctx, uri);
-
     if ((ret = ff_tls_open_underlying(shr, h, uri, options)) < 0)
         goto fail;
+
+#ifdef MBEDTLS_PSA_CRYPTO_C
+    if ((ret = psa_crypto_init()) != PSA_SUCCESS) {
+        av_log(h, AV_LOG_ERROR, "psa_crypto_init returned %d\n", ret);
+        goto fail;
+    }
+#endif
 
     mbedtls_ssl_init(&tls_ctx->ssl_context);
     mbedtls_ssl_config_init(&tls_ctx->ssl_config);
@@ -184,6 +197,14 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     mbedtls_ctr_drbg_init(&tls_ctx->ctr_drbg_context);
     mbedtls_x509_crt_init(&tls_ctx->ca_cert);
     mbedtls_pk_init(&tls_ctx->priv_key);
+
+    if (av_log_get_level() >= AV_LOG_DEBUG) {
+        mbedtls_ssl_conf_dbg(&tls_ctx->ssl_config, mbedtls_debug, shr->tcp);
+        /*
+         * Note: we can't call mbedtls_debug_set_threshold() here because
+         * it's global state. The user is thus expected to manage this.
+         */
+    }
 
     // load trusted CA
     if (shr->ca_file) {
@@ -233,8 +254,17 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
         goto fail;
     }
 
+#ifdef MBEDTLS_SSL_PROTO_TLS1_3
+    // this version does not allow disabling certificate verification with TLSv1.3 (yes, really).
+    if (mbedtls_version_get_number() == 0x03060000 && !shr->verify) {
+        av_log(h, AV_LOG_INFO, "Forcing TLSv1.2 because certificate verification is disabled\n");
+        mbedtls_ssl_conf_max_tls_version(&tls_ctx->ssl_config, MBEDTLS_SSL_VERSION_TLS1_2);
+    }
+#endif
+
+    // not VERIFY_REQUIRED because we manually check after handshake
     mbedtls_ssl_conf_authmode(&tls_ctx->ssl_config,
-                              shr->verify ? MBEDTLS_SSL_VERIFY_REQUIRED : MBEDTLS_SSL_VERIFY_NONE);
+                              shr->verify ? MBEDTLS_SSL_VERIFY_OPTIONAL : MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&tls_ctx->ssl_config, mbedtls_ctr_drbg_random, &tls_ctx->ctr_drbg_context);
     mbedtls_ssl_conf_ca_chain(&tls_ctx->ssl_config, &tls_ctx->ca_cert, NULL);
 
@@ -291,6 +321,9 @@ static int handle_tls_error(URLContext *h, const char* func_name, int ret)
     switch (ret) {
     case MBEDTLS_ERR_SSL_WANT_READ:
     case MBEDTLS_ERR_SSL_WANT_WRITE:
+#ifdef MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
+    case MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET:
+#endif
         return AVERROR(EAGAIN);
     case MBEDTLS_ERR_NET_SEND_FAILED:
     case MBEDTLS_ERR_NET_RECV_FAILED:
@@ -310,6 +343,8 @@ static int tls_read(URLContext *h, uint8_t *buf, int size)
     TLSContext *tls_ctx = h->priv_data;
     int ret;
 
+    tls_ctx->tls_shared.tcp->flags &= ~AVIO_FLAG_NONBLOCK;
+    tls_ctx->tls_shared.tcp->flags |= h->flags & AVIO_FLAG_NONBLOCK;
     if ((ret = mbedtls_ssl_read(&tls_ctx->ssl_context, buf, size)) > 0) {
         // return read length
         return ret;
@@ -323,6 +358,8 @@ static int tls_write(URLContext *h, const uint8_t *buf, int size)
     TLSContext *tls_ctx = h->priv_data;
     int ret;
 
+    tls_ctx->tls_shared.tcp->flags &= ~AVIO_FLAG_NONBLOCK;
+    tls_ctx->tls_shared.tcp->flags |= h->flags & AVIO_FLAG_NONBLOCK;
     if ((ret = mbedtls_ssl_write(&tls_ctx->ssl_context, buf, size)) > 0) {
         // return written length
         return ret;

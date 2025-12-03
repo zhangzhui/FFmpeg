@@ -1,5 +1,5 @@
-7adef53df9e14358e0b99f8a829e2d97 *tests/data/fate/matroska-dovi-write-config7.matroska
-72700 tests/data/fate/matroska-dovi-write-config7.matroska
+adafbb4d021db027f4ae4ef7ca1c56c2 *tests/data/fate/matroska-dovi-write-config7.matroska
+72640 tests/data/fate/matroska-dovi-write-config7.matroska
 #extradata 0:      116, 0x2b8d1669
 #extradata 1:      116, 0x2b8d1669
 #tb 0: 1/1000
@@ -45,5 +45,6 @@ rpu_present_flag=1
 el_present_flag=1
 bl_present_flag=0
 dv_bl_signal_compatibility_id=6
+dv_md_compression=none
 [/SIDE_DATA]
 [/STREAM]

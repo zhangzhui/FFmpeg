@@ -36,6 +36,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "avformat.h"
+#include "avio_internal.h"
 #include "demux.h"
 #include "internal.h"
 #include "sauce.h"
@@ -93,11 +94,14 @@ static int next_tag_read(AVFormatContext *avctx, uint64_t *fsize)
     AVIOContext *pb = avctx->pb;
     char buf[36];
     int len;
-    uint64_t start_pos = avio_size(pb) - 256;
+    int64_t start_pos = avio_size(pb);
 
-    avio_seek(pb, start_pos, SEEK_SET);
-    if (avio_read(pb, buf, sizeof(next_magic)) != sizeof(next_magic))
-        return -1;
+    if (start_pos < 256)
+        return AVERROR_INVALIDDATA;
+
+    avio_seek(pb, start_pos - 256, SEEK_SET);
+    if ((len = ffio_read_size(pb, buf, sizeof(next_magic))) < 0)
+        return len;
     if (memcmp(buf, next_magic, sizeof(next_magic)))
         return -1;
     if (avio_r8(pb) != 0x01)
@@ -241,11 +245,14 @@ static int xbin_read_header(AVFormatContext *s)
         return ret;
     st->codecpar->extradata[0] = fontheight;
     st->codecpar->extradata[1] = flags;
-    if (avio_read(pb, st->codecpar->extradata + 2, st->codecpar->extradata_size - 2) < 0)
-        return AVERROR(EIO);
+    if ((ret = ffio_read_size(pb, st->codecpar->extradata + 2, st->codecpar->extradata_size - 2)) < 0)
+        return ret;
 
     if (pb->seekable & AVIO_SEEKABLE_NORMAL) {
-        bin->fsize = avio_size(pb) - 9 - st->codecpar->extradata_size;
+        int64_t fsize =  avio_size(pb);
+        if (fsize < 9 + st->codecpar->extradata_size)
+            return 0;
+        bin->fsize = fsize - 9 - st->codecpar->extradata_size;
         ff_sauce_read(s, &bin->fsize, NULL, 0);
         avio_seek(pb, 9 + st->codecpar->extradata_size, SEEK_SET);
     }
@@ -275,17 +282,20 @@ static int adf_read_header(AVFormatContext *s)
     st->codecpar->extradata[0] = 16;
     st->codecpar->extradata[1] = BINTEXT_PALETTE|BINTEXT_FONT;
 
-    if (avio_read(pb, st->codecpar->extradata + 2, 24) < 0)
-        return AVERROR(EIO);
+    if ((ret = ffio_read_size(pb, st->codecpar->extradata + 2, 24)) < 0)
+        return ret;
     avio_skip(pb, 144);
-    if (avio_read(pb, st->codecpar->extradata + 2 + 24, 24) < 0)
-        return AVERROR(EIO);
-    if (avio_read(pb, st->codecpar->extradata + 2 + 48, 4096) < 0)
-        return AVERROR(EIO);
+    if ((ret = ffio_read_size(pb, st->codecpar->extradata + 2 + 24, 24)) < 0)
+        return ret;
+    if ((ret = ffio_read_size(pb, st->codecpar->extradata + 2 + 48, 4096)) < 0)
+        return ret;
 
     if (pb->seekable & AVIO_SEEKABLE_NORMAL) {
         int got_width = 0;
-        bin->fsize = avio_size(pb) - 1 - 192 - 4096;
+        int64_t fsize =  avio_size(pb);
+        if (fsize < 1 + 192 + 4096)
+            return 0;
+        bin->fsize = fsize - 1 - 192 - 4096;
         st->codecpar->width = 80<<3;
         ff_sauce_read(s, &bin->fsize, &got_width, 0);
         if (st->codecpar->width < 8)
@@ -318,9 +328,10 @@ static int idf_read_header(AVFormatContext *s)
     AVIOContext *pb = s->pb;
     AVStream *st;
     int got_width = 0, ret;
+    int64_t fsize;
 
     if (!(pb->seekable & AVIO_SEEKABLE_NORMAL))
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
 
     st = init_stream(s);
     if (!st)
@@ -332,14 +343,18 @@ static int idf_read_header(AVFormatContext *s)
     st->codecpar->extradata[0] = 16;
     st->codecpar->extradata[1] = BINTEXT_PALETTE|BINTEXT_FONT;
 
-    avio_seek(pb, avio_size(pb) - 4096 - 48, SEEK_SET);
+    fsize = avio_size(pb);
+    if (fsize < 12 + 4096 + 48)
+        return AVERROR_INVALIDDATA;
+    bin->fsize = fsize - 12 - 4096 - 48;
 
-    if (avio_read(pb, st->codecpar->extradata + 2 + 48, 4096) < 0)
-        return AVERROR(EIO);
-    if (avio_read(pb, st->codecpar->extradata + 2, 48) < 0)
-        return AVERROR(EIO);
+    avio_seek(pb, bin->fsize + 12, SEEK_SET);
 
-    bin->fsize = avio_size(pb) - 12 - 4096 - 48;
+    if ((ret = ffio_read_size(pb, st->codecpar->extradata + 2 + 48, 4096)) < 0)
+        return ret;
+    if ((ret = ffio_read_size(pb, st->codecpar->extradata + 2, 48)) < 0)
+        return ret;
+
     ff_sauce_read(s, &bin->fsize, &got_width, 0);
     if (st->codecpar->width < 8)
         return AVERROR_INVALIDDATA;
@@ -357,15 +372,15 @@ static int read_packet(AVFormatContext *s,
 
     if (bin->fsize > 0) {
         if (av_get_packet(s->pb, pkt, bin->fsize) < 0)
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         bin->fsize = -1; /* done */
     } else if (!bin->fsize) {
         if (avio_feof(s->pb))
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         if (av_get_packet(s->pb, pkt, bin->chars_per_frame) < 0)
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
     } else {
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
 
     pkt->flags |= AV_PKT_FLAG_KEY;

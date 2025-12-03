@@ -22,7 +22,7 @@
 #include "libavutil/macros.h"
 #include "libavutil/mem_internal.h"
 
-#include "libavcodec/hevcdsp.h"
+#include "libavcodec/hevc/dsp.h"
 
 #include "checkasm.h"
 
@@ -57,7 +57,8 @@ static void check_deblock_chroma(HEVCDSPContext *h, int bit_depth, int c)
     LOCAL_ALIGNED_32(uint8_t, buf0, [BUF_SIZE]);
     LOCAL_ALIGNED_32(uint8_t, buf1, [BUF_SIZE]);
 
-    declare_func(void, uint8_t *pix, ptrdiff_t stride, int32_t *tc, uint8_t *no_p, uint8_t *no_q);
+    declare_func(void, uint8_t *pix, ptrdiff_t stride,
+                 const int32_t *tc, const uint8_t *no_p, const uint8_t *no_q);
 
     if (check_func(c ? h->hevc_h_loop_filter_chroma_c : h->hevc_h_loop_filter_chroma,
                          "hevc_h_loop_filter_chroma%d%s", bit_depth, c ? "_full" : ""))
@@ -166,7 +167,7 @@ static void randomize_luma_buffers(int type, int *beta, int32_t tc[2],
             tc25diff = FFMAX(tc25 - 1, 0);
             // 4 lines per tc
             for (i = 0; i < 4; i++) {
-                // Weak filtering is signficantly simpler to activate as
+                // Weak filtering is significantly simpler to activate as
                 // we only need to satisfy d0 + d3 < beta, which
                 // can be simplified to d0 + d0 < beta. Using the above
                 // derivations but substiuting b3 for b1 and ensuring
@@ -226,7 +227,8 @@ static void check_deblock_luma(HEVCDSPContext *h, int bit_depth, int c)
     uint8_t *ptr0 = buf0 + BUF_OFFSET,
             *ptr1 = buf1 + BUF_OFFSET;
 
-    declare_func(void, uint8_t *pix, ptrdiff_t stride, int beta, int32_t *tc, uint8_t *no_p, uint8_t *no_q);
+    declare_func(void, uint8_t *pix, ptrdiff_t stride, int beta,
+                 const int32_t *tc, const uint8_t *no_p, const uint8_t *no_q);
     memset(buf0, 0, BUF_SIZE);
 
     for (int j = 0; j < 3; j++) {

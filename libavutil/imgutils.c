@@ -298,7 +298,7 @@ int av_image_check_size2(unsigned int w, unsigned int h, int64_t max_pixels, enu
         stride = 8LL*w;
     stride += 128*8;
 
-    if ((int)w<=0 || (int)h<=0 || stride >= INT_MAX || stride*(uint64_t)(h+128) >= INT_MAX) {
+    if (w==0 || h==0 || w > INT32_MAX || h > INT32_MAX || stride >= INT_MAX || stride*(h + 128ULL) >= INT_MAX) {
         av_log(&imgutils, AV_LOG_ERROR, "Picture size %ux%u is invalid\n", w, h);
         return AVERROR(EINVAL);
     }
@@ -362,7 +362,7 @@ void av_image_copy_plane_uc_from(uint8_t *dst, ptrdiff_t dst_linesize,
 {
     int ret = -1;
 
-#if ARCH_X86
+#if ARCH_X86 && HAVE_X86ASM
     ret = ff_image_copy_plane_uc_from_x86(dst, dst_linesize, src, src_linesize,
                                           bytewidth, height);
 #endif

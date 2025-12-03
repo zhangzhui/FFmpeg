@@ -24,6 +24,7 @@
 #include "avs3.h"
 #include "get_bits.h"
 #include "parser.h"
+#include "parser_internal.h"
 
 static int avs3_find_frame_end(ParseContext *pc, const uint8_t *buf, int buf_size)
 {
@@ -73,7 +74,8 @@ static void parse_avs3_nal_units(AVCodecParserContext *s, const uint8_t *buf,
             GetBitContext gb;
             int profile, ratecode, low_delay;
 
-            init_get_bits8(&gb, buf + 4, buf_size - 4);
+            av_unused int ret = init_get_bits(&gb, buf + 4, 100);
+            av_assert1(ret >= 0);
 
             s->key_frame = 1;
             s->pict_type = AV_PICTURE_TYPE_I;
@@ -96,7 +98,7 @@ static void parse_avs3_nal_units(AVCodecParserContext *s, const uint8_t *buf,
                 if (sample_precision == 1) {
                     avctx->pix_fmt = AV_PIX_FMT_YUV420P;
                 } else if (sample_precision == 2) {
-                    avctx->pix_fmt = AV_PIX_FMT_YUV420P10LE;
+                    avctx->pix_fmt = AV_PIX_FMT_YUV420P10;
                 } else {
                     avctx->pix_fmt = AV_PIX_FMT_NONE;
                 }
@@ -171,9 +173,9 @@ static int avs3_parse(AVCodecParserContext *s, AVCodecContext *avctx,
     return next;
 }
 
-const AVCodecParser ff_avs3_parser = {
-    .codec_ids      = { AV_CODEC_ID_AVS3 },
+const FFCodecParser ff_avs3_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_AVS3),
     .priv_data_size = sizeof(ParseContext),
-    .parser_parse   = avs3_parse,
-    .parser_close   = ff_parse_close,
+    .parse          = avs3_parse,
+    .close          = ff_parse_close,
 };

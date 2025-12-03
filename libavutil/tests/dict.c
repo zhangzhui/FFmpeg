@@ -45,8 +45,11 @@ static const AVDictionaryEntry *dict_iterate(const AVDictionary *m,
 static void print_dict(const AVDictionary *m)
 {
     const AVDictionaryEntry *t = NULL;
-    while ((t = dict_iterate(m, t)))
-        printf("%s %s   ", t->key, t->value);
+    const char *sep = "";
+    while ((t = dict_iterate(m, t))) {
+        printf("%s%s %s", sep, t->key, t->value);
+        sep = "   ";
+    }
     printf("\n");
 }
 
@@ -150,12 +153,15 @@ int main(void)
 
     //valgrind sensible test
     printf("\nTesting av_dict_set() with existing AVDictionaryEntry.key as key\n");
-    av_dict_set(&dict, "key", "old", 0);
+    if (av_dict_set(&dict, "key", "old", 0) < 0)
+        return 1;
     e = av_dict_get(dict, "key", NULL, 0);
-    av_dict_set(&dict, e->key, "new val OK", 0);
+    if (av_dict_set(&dict, e->key, "new val OK", 0) < 0)
+        return 1;
     e = av_dict_get(dict, "key", NULL, 0);
     printf("%s\n", e->value);
-    av_dict_set(&dict, e->key, e->value, 0);
+    if (av_dict_set(&dict, e->key, e->value, 0) < 0)
+        return 1;
     e = av_dict_get(dict, "key", NULL, 0);
     printf("%s\n", e->value);
     av_dict_free(&dict);

@@ -31,7 +31,11 @@ extern "C" {
 #include "libavformat/internal.h"
 }
 
+#include <DeckLinkAPIVersion.h>
 #include <DeckLinkAPI.h>
+#if BLACKMAGIC_DECKLINK_API_VERSION >= 0x0e030000
+#include <DeckLinkAPI_v14_2_1.h>
+#endif
 
 extern "C" {
 #include "config.h"
@@ -105,7 +109,7 @@ static VANCLineNumber vanc_line_numbers[] = {
     {bmdModeUnknown, 0, -1, -1, -1}
 };
 
-class decklink_allocator : public IDeckLinkMemoryAllocator
+class decklink_allocator : public IDeckLinkMemoryAllocator_v14_2_1
 {
 public:
         decklink_allocator(): _refs(1) { }
@@ -129,7 +133,21 @@ public:
         virtual HRESULT STDMETHODCALLTYPE Decommit() { return S_OK; }
 
         // IUnknown methods
-        virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv) { return E_NOINTERFACE; }
+        virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID *ppv)
+        {
+            if (DECKLINK_IsEqualIID(riid, IID_IUnknown)) {
+                *ppv = static_cast<IUnknown*>(this);
+            } else if (DECKLINK_IsEqualIID(riid, IID_IDeckLinkMemoryAllocator_v14_2_1)) {
+                *ppv = static_cast<IDeckLinkMemoryAllocator_v14_2_1*>(this);
+            } else {
+                *ppv = NULL;
+                return E_NOINTERFACE;
+            }
+
+            AddRef();
+            return S_OK;
+        }
+
         virtual ULONG   STDMETHODCALLTYPE AddRef(void) { return ++_refs; }
         virtual ULONG   STDMETHODCALLTYPE Release(void)
         {
@@ -472,7 +490,7 @@ skip_packet:
 }
 
 
-static void handle_klv(AVFormatContext *avctx, decklink_ctx *ctx, IDeckLinkVideoInputFrame *videoFrame, int64_t pts)
+static void handle_klv(AVFormatContext *avctx, decklink_ctx *ctx, IDeckLinkVideoInputFrame_v14_2_1 *videoFrame, int64_t pts)
 {
     const uint8_t KLV_DID = 0x44;
     const uint8_t KLV_IN_VANC_SDID = 0x04;
@@ -574,17 +592,30 @@ static void handle_klv(AVFormatContext *avctx, decklink_ctx *ctx, IDeckLinkVideo
     }
 }
 
-class decklink_input_callback : public IDeckLinkInputCallback
+class decklink_input_callback : public IDeckLinkInputCallback_v14_2_1
 {
 public:
         explicit decklink_input_callback(AVFormatContext *_avctx);
         ~decklink_input_callback();
 
-        virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv) { return E_NOINTERFACE; }
+        virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID *ppv)
+        {
+            if (DECKLINK_IsEqualIID(riid, IID_IUnknown)) {
+                *ppv = static_cast<IUnknown*>(this);
+            } else if (DECKLINK_IsEqualIID(riid, IID_IDeckLinkInputCallback_v14_2_1)) {
+                *ppv = static_cast<IDeckLinkInputCallback_v14_2_1*>(this);
+            } else {
+                *ppv = NULL;
+                return E_NOINTERFACE;
+            }
+
+            AddRef();
+            return S_OK;
+        }
         virtual ULONG STDMETHODCALLTYPE AddRef(void);
         virtual ULONG STDMETHODCALLTYPE  Release(void);
         virtual HRESULT STDMETHODCALLTYPE VideoInputFormatChanged(BMDVideoInputFormatChangedEvents, IDeckLinkDisplayMode*, BMDDetectedVideoInputFormatFlags);
-        virtual HRESULT STDMETHODCALLTYPE VideoInputFrameArrived(IDeckLinkVideoInputFrame*, IDeckLinkAudioInputPacket*);
+        virtual HRESULT STDMETHODCALLTYPE VideoInputFrameArrived(IDeckLinkVideoInputFrame_v14_2_1*, IDeckLinkAudioInputPacket*);
 
 private:
         std::atomic<int>  _refs;
@@ -593,6 +624,7 @@ private:
         int no_video;
         int64_t initial_video_pts;
         int64_t initial_audio_pts;
+        IDeckLinkVideoInputFrame_v14_2_1* last_video_frame;
 };
 
 decklink_input_callback::decklink_input_callback(AVFormatContext *_avctx) : _refs(1)
@@ -602,10 +634,13 @@ decklink_input_callback::decklink_input_callback(AVFormatContext *_avctx) : _ref
     ctx = (struct decklink_ctx *)cctx->ctx;
     no_video = 0;
     initial_audio_pts = initial_video_pts = AV_NOPTS_VALUE;
+    last_video_frame = nullptr;
 }
 
 decklink_input_callback::~decklink_input_callback()
 {
+    if (last_video_frame)
+        last_video_frame->Release();
 }
 
 ULONG decklink_input_callback::AddRef(void)
@@ -621,7 +656,7 @@ ULONG decklink_input_callback::Release(void)
     return ret;
 }
 
-static int64_t get_pkt_pts(IDeckLinkVideoInputFrame *videoFrame,
+static int64_t get_pkt_pts(IDeckLinkVideoInputFrame_v14_2_1 *videoFrame,
                            IDeckLinkAudioInputPacket *audioFrame,
                            int64_t wallclock,
                            int64_t abs_wallclock,
@@ -675,7 +710,7 @@ static int64_t get_pkt_pts(IDeckLinkVideoInputFrame *videoFrame,
     return pts;
 }
 
-static int get_bmd_timecode(AVFormatContext *avctx, AVTimecode *tc, AVRational frame_rate, BMDTimecodeFormat tc_format, IDeckLinkVideoInputFrame *videoFrame)
+static int get_bmd_timecode(AVFormatContext *avctx, AVTimecode *tc, AVRational frame_rate, BMDTimecodeFormat tc_format, IDeckLinkVideoInputFrame_v14_2_1 *videoFrame)
 {
     IDeckLinkTimecode *timecode;
     int ret = AVERROR(ENOENT);
@@ -697,7 +732,7 @@ static int get_bmd_timecode(AVFormatContext *avctx, AVTimecode *tc, AVRational f
     return ret;
 }
 
-static int get_frame_timecode(AVFormatContext *avctx, decklink_ctx *ctx, AVTimecode *tc, IDeckLinkVideoInputFrame *videoFrame)
+static int get_frame_timecode(AVFormatContext *avctx, decklink_ctx *ctx, AVTimecode *tc, IDeckLinkVideoInputFrame_v14_2_1 *videoFrame)
 {
     AVRational frame_rate = ctx->video_st->r_frame_rate;
     int ret;
@@ -722,13 +757,14 @@ static int get_frame_timecode(AVFormatContext *avctx, decklink_ctx *ctx, AVTimec
 }
 
 HRESULT decklink_input_callback::VideoInputFrameArrived(
-    IDeckLinkVideoInputFrame *videoFrame, IDeckLinkAudioInputPacket *audioFrame)
+    IDeckLinkVideoInputFrame_v14_2_1 *videoFrame, IDeckLinkAudioInputPacket *audioFrame)
 {
     void *frameBytes;
     void *audioFrameBytes;
     BMDTimeValue frameTime;
     BMDTimeValue frameDuration;
     int64_t wallclock = 0, abs_wallclock = 0;
+    int64_t video_pkt_pts, audio_pkt_pts;
     struct decklink_cctx *cctx = (struct decklink_cctx *) avctx->priv_data;
 
     if (ctx->autodetect) {
@@ -755,6 +791,8 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
         wallclock = av_gettime_relative();
     if (ctx->audio_pts_source == PTS_SRC_ABS_WALLCLOCK || ctx->video_pts_source == PTS_SRC_ABS_WALLCLOCK)
         abs_wallclock = av_gettime();
+    video_pkt_pts = get_pkt_pts(videoFrame, audioFrame, wallclock, abs_wallclock, ctx->video_pts_source, ctx->video_st->time_base, &initial_video_pts, cctx->copyts);
+    audio_pkt_pts = get_pkt_pts(videoFrame, audioFrame, wallclock, abs_wallclock, ctx->audio_pts_source, ctx->audio_st->time_base, &initial_audio_pts, cctx->copyts);
 
     // Handle Video Frame
     if (videoFrame) {
@@ -773,7 +811,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
                                   ctx->video_st->time_base.den);
 
         if (videoFrame->GetFlags() & bmdFrameHasNoInputSource) {
-            if (ctx->draw_bars && videoFrame->GetPixelFormat() == bmdFormat8BitYUV) {
+            if (ctx->signal_loss_action == SIGNAL_LOSS_BARS && videoFrame->GetPixelFormat() == bmdFormat8BitYUV) {
                 unsigned bars[8] = {
                     0xEA80EA80, 0xD292D210, 0xA910A9A5, 0x90229035,
                     0x6ADD6ACA, 0x51EF515A, 0x286D28EF, 0x10801080 };
@@ -785,6 +823,9 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
                     for (int x = 0; x < width; x += 2)
                         *p++ = bars[(x * 8) / width];
                 }
+            } else if (ctx->signal_loss_action == SIGNAL_LOSS_REPEAT && last_video_frame) {
+                videoFrame = last_video_frame;
+                videoFrame->GetBytes(&frameBytes);
             }
 
             if (!no_video) {
@@ -793,6 +834,12 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
             }
             no_video = 1;
         } else {
+            if (ctx->signal_loss_action == SIGNAL_LOSS_REPEAT) {
+                if (last_video_frame)
+                    last_video_frame->Release();
+                last_video_frame = videoFrame;
+                last_video_frame->AddRef();
+            }
             if (no_video) {
                 av_log(avctx, AV_LOG_WARNING, "Frame received (#%lu) - Input returned "
                         "- Frames dropped %u\n", ctx->frameCount, ++ctx->dropped);
@@ -846,7 +893,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
             return S_OK;
         }
 
-        pkt.pts = get_pkt_pts(videoFrame, audioFrame, wallclock, abs_wallclock, ctx->video_pts_source, ctx->video_st->time_base, &initial_video_pts, cctx->copyts);
+        pkt.pts = video_pkt_pts;
         pkt.dts = pkt.pts;
 
         pkt.duration = frameDuration;
@@ -949,7 +996,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
         pkt.size = audioFrame->GetSampleFrameCount() * ctx->audio_st->codecpar->ch_layout.nb_channels * (ctx->audio_depth / 8);
         audioFrame->GetBytes(&audioFrameBytes);
         audioFrame->GetPacketTime(&audio_pts, ctx->audio_st->time_base.den);
-        pkt.pts = get_pkt_pts(videoFrame, audioFrame, wallclock, abs_wallclock, ctx->audio_pts_source, ctx->audio_st->time_base, &initial_audio_pts, cctx->copyts);
+        pkt.pts = audio_pkt_pts;
         pkt.dts = pkt.pts;
 
         //fprintf(stderr,"Audio Frame size %d ts %d\n", pkt.size, pkt.pts);
@@ -1036,6 +1083,7 @@ av_cold int ff_decklink_read_close(AVFormatContext *avctx)
         ctx->dli->StopStreams();
         ctx->dli->DisableVideoInput();
         ctx->dli->DisableAudioInput();
+        ctx->dli->SetCallback(nullptr);
     }
 
     ff_decklink_cleanup(avctx);
@@ -1074,6 +1122,16 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
     ctx->audio_pts_source = cctx->audio_pts_source;
     ctx->video_pts_source = cctx->video_pts_source;
     ctx->draw_bars = cctx->draw_bars;
+    ctx->signal_loss_action = cctx->signal_loss_action;
+    if (!ctx->draw_bars && ctx->signal_loss_action == SIGNAL_LOSS_BARS) {
+        ctx->signal_loss_action = SIGNAL_LOSS_NONE;
+        av_log(avctx, AV_LOG_WARNING, "Setting signal_loss_action to none because draw_bars is false\n");
+    }
+    if (!ctx->draw_bars && ctx->signal_loss_action != SIGNAL_LOSS_NONE) {
+        av_log(avctx, AV_LOG_ERROR, "options draw_bars and signal_loss_action are mutually exclusive\n");
+        av_freep(&ctx);
+        return AVERROR(EINVAL);
+    }
     ctx->audio_depth = cctx->audio_depth;
     if (cctx->raw_format > 0 && (unsigned int)cctx->raw_format < FF_ARRAY_ELEMS(decklink_raw_format_map))
         ctx->raw_format = decklink_raw_format_map[cctx->raw_format];
@@ -1087,7 +1145,8 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
             break;
         default:
             av_log(avctx, AV_LOG_ERROR, "Value of channels option must be one of 2, 8 or 16\n");
-            return AVERROR(EINVAL);
+            ret = AVERROR(EINVAL);
+            goto error;
     }
 
     /* Check audio bit depth option for valid values: 16 or 32 */
@@ -1097,21 +1156,23 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
             break;
         default:
             av_log(avctx, AV_LOG_ERROR, "Value for audio bit depth option must be either 16 or 32\n");
-            return AVERROR(EINVAL);
+            ret = AVERROR(EINVAL);
+            goto error;
     }
 
     /* List available devices. */
     if (ctx->list_devices) {
         ff_decklink_list_devices_legacy(avctx, 1, 0);
-        return AVERROR_EXIT;
+        ret = AVERROR_EXIT;
+        goto error;
     }
 
     ret = ff_decklink_init_device(avctx, avctx->url);
     if (ret < 0)
-        return ret;
+        goto error;
 
     /* Get input device. */
-    if (ctx->dl->QueryInterface(IID_IDeckLinkInput, (void **) &ctx->dli) != S_OK) {
+    if (ctx->dl->QueryInterface(IID_IDeckLinkInput_v14_2_1, (void **) &ctx->dli) != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Could not open input device from '%s'\n",
                avctx->url);
         ret = AVERROR(EIO);
@@ -1309,6 +1370,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
 
 error:
     ff_decklink_cleanup(avctx);
+    av_freep(&cctx->ctx);
     return ret;
 }
 

@@ -19,9 +19,8 @@
  */
 
 #include "libavutil/channel_layout.h"
+#include "libavfilter/audio.h"
 #include "libavfilter/formats.c"
-
-#undef printf
 
 const int64_t avfilter_all_channel_layouts[] = {
     AV_CH_FRONT_CENTER,

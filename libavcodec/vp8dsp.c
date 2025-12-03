@@ -249,14 +249,14 @@ MK_IDCT_DC_ADD4_C(vp8)
 
 // because I like only having two parameters to pass functions...
 #define LOAD_PIXELS                                                           \
-    int av_unused p3 = p[-4 * stride];                                        \
-    int av_unused p2 = p[-3 * stride];                                        \
-    int av_unused p1 = p[-2 * stride];                                        \
-    int av_unused p0 = p[-1 * stride];                                        \
-    int av_unused q0 = p[ 0 * stride];                                        \
-    int av_unused q1 = p[ 1 * stride];                                        \
-    int av_unused q2 = p[ 2 * stride];                                        \
-    int av_unused q3 = p[ 3 * stride];
+    av_unused int p3 = p[-4 * stride];                                        \
+    av_unused int p2 = p[-3 * stride];                                        \
+    av_unused int p1 = p[-2 * stride];                                        \
+    av_unused int p0 = p[-1 * stride];                                        \
+    av_unused int q0 = p[ 0 * stride];                                        \
+    av_unused int q1 = p[ 1 * stride];                                        \
+    av_unused int q2 = p[ 2 * stride];                                        \
+    av_unused int q3 = p[ 3 * stride];
 
 #define clip_int8(n) (cm[(n) + 0x80] - 0x80)
 
@@ -681,7 +681,9 @@ av_cold void ff_vp78dsp_init(VP8DSPContext *dsp)
     ff_vp78dsp_init_arm(dsp);
 #elif ARCH_PPC
     ff_vp78dsp_init_ppc(dsp);
-#elif ARCH_X86
+#elif ARCH_RISCV
+    ff_vp78dsp_init_riscv(dsp);
+#elif ARCH_X86 && HAVE_X86ASM
     ff_vp78dsp_init_x86(dsp);
 #endif
 }
@@ -710,6 +712,10 @@ av_cold void ff_vp7dsp_init(VP8DSPContext *dsp)
 
     dsp->vp8_v_loop_filter_simple = vp7_v_loop_filter_simple_c;
     dsp->vp8_h_loop_filter_simple = vp7_h_loop_filter_simple_c;
+
+#if ARCH_RISCV
+    ff_vp7dsp_init_riscv(dsp);
+#endif
 }
 #endif /* CONFIG_VP7_DECODER */
 
@@ -744,7 +750,7 @@ av_cold void ff_vp8dsp_init(VP8DSPContext *dsp)
     ff_vp8dsp_init_arm(dsp);
 #elif ARCH_RISCV
     ff_vp8dsp_init_riscv(dsp);
-#elif ARCH_X86
+#elif ARCH_X86 && HAVE_X86ASM
     ff_vp8dsp_init_x86(dsp);
 #elif ARCH_MIPS
     ff_vp8dsp_init_mips(dsp);

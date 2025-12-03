@@ -146,13 +146,13 @@ static int cbs_jpeg_split_fragment(CodedBitstreamContext *ctx,
             }
         } else {
             i = start;
-            if (i + 2 > frag->data_size) {
+            if (i > frag->data_size - 2) {
                 av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid JPEG image: "
                        "truncated at %02x marker.\n", marker);
                 return AVERROR_INVALIDDATA;
             }
             length = AV_RB16(frag->data + i);
-            if (i + length > frag->data_size) {
+            if (length > frag->data_size - i) {
                 av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid JPEG image: "
                        "truncated at %02x marker segment.\n", marker);
                 return AVERROR_INVALIDDATA;
@@ -417,7 +417,7 @@ static int cbs_jpeg_assemble_fragment(CodedBitstreamContext *ctx,
     return 0;
 }
 
-static const CodedBitstreamUnitTypeDescriptor cbs_jpeg_unit_types[] = {
+static CodedBitstreamUnitTypeDescriptor cbs_jpeg_unit_types[] = {
     CBS_UNIT_RANGE_POD(JPEG_MARKER_SOF0, JPEG_MARKER_SOF3, JPEGRawFrameHeader),
 
     CBS_UNIT_RANGE_INTERNAL_REF(JPEG_MARKER_APPN, JPEG_MARKER_APPN + 15,

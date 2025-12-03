@@ -199,7 +199,10 @@ static int siff_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (c->cur_frame >= c->frames)
             return AVERROR_EOF;
         if (c->curstrm == -1) {
-            c->pktsize = avio_rl32(s->pb) - 4;
+            unsigned pktsize = avio_rl32(s->pb);
+            if (pktsize < 4)
+                return AVERROR_INVALIDDATA;
+            c->pktsize = pktsize - 4;
             c->flags   = avio_rl16(s->pb);
             if (c->flags & VB_HAS_AUDIO && !c->has_audio)
                 return AVERROR_INVALIDDATA;
@@ -229,7 +232,7 @@ static int siff_read_packet(AVFormatContext *s, AVPacket *pkt)
         } else {
             int pktsize = av_get_packet(s->pb, pkt, c->sndsize - 4);
             if (pktsize < 0)
-                return AVERROR(EIO);
+                return AVERROR_INVALIDDATA;
             pkt->stream_index = 1;
             pkt->duration     = pktsize;
             c->curstrm        = 0;
@@ -243,7 +246,7 @@ static int siff_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (!pktsize)
             return AVERROR_EOF;
         if (pktsize <= 0)
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         pkt->duration = pktsize;
     }
     return pkt->size;

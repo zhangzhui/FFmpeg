@@ -94,12 +94,12 @@ typedef struct FileContext {
     int fd;
     int trunc;
     int blocksize;
+    int pkt_size;
     int follow;
     int seekable;
 #if HAVE_DIRENT_H
     DIR *dir;
 #endif
-    int64_t initial_pos;
 } FileContext;
 
 static const AVOption file_options[] = {
@@ -107,6 +107,7 @@ static const AVOption file_options[] = {
     { "blocksize", "set I/O operation maximum block size", offsetof(FileContext, blocksize), AV_OPT_TYPE_INT, { .i64 = INT_MAX }, 1, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM },
     { "follow", "Follow a file as it is being written", offsetof(FileContext, follow), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     { "seekable", "Sets if the file is seekable", offsetof(FileContext, seekable), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 0, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
+    { "pkt_size", "Maximum packet size", offsetof(FileContext, pkt_size), AV_OPT_TYPE_INT, { .i64 = 262144 }, 1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
     { NULL }
 };
 
@@ -194,6 +195,7 @@ static int file_check(URLContext *h, int mask)
     return ret;
 }
 
+#if CONFIG_FD_PROTOCOL || CONFIG_PIPE_PROTOCOL
 static int fd_dup(URLContext *h, int oldfd)
 {
     int newfd;
@@ -216,16 +218,12 @@ static int fd_dup(URLContext *h, int oldfd)
 #endif
     return newfd;
 }
+#endif
 
 static int file_close(URLContext *h)
 {
     FileContext *c = h->priv_data;
-    int ret;
-
-    if (c->initial_pos >= 0 && !h->is_streamed)
-        lseek(c->fd, c->initial_pos, SEEK_SET);
-
-    ret = close(c->fd);
+    int ret = close(c->fd);
     return (ret == -1) ? AVERROR(errno) : 0;
 }
 
@@ -293,7 +291,6 @@ static int file_open(URLContext *h, const char *filename, int flags)
 
     av_strstart(filename, "file:", &filename);
 
-    c->initial_pos = -1;
     if (flags & AVIO_FLAG_WRITE && flags & AVIO_FLAG_READ) {
         access = O_CREAT | O_RDWR;
         if (c->trunc)
@@ -318,7 +315,7 @@ static int file_open(URLContext *h, const char *filename, int flags)
     /* Buffer writes more than the default 32k to improve throughput especially
      * with networked file systems */
     if (!h->is_streamed && flags & AVIO_FLAG_WRITE)
-        h->min_packet_size = h->max_packet_size = 262144;
+        h->min_packet_size = h->max_packet_size = c->pkt_size;
 
     if (c->seekable >= 0)
         h->is_streamed = !c->seekable;
@@ -442,13 +439,16 @@ static int pipe_open(URLContext *h, const char *filename, int flags)
     if (c->fd < 0) {
         av_strstart(filename, "pipe:", &filename);
 
-        fd = strtol(filename, &final, 10);
-        if((filename == final) || *final ) {/* No digits found, or something like 10ab */
+        if (!*filename) {
             if (flags & AVIO_FLAG_WRITE) {
                 fd = 1;
             } else {
                 fd = 0;
             }
+        } else {
+            fd = strtol(filename, &final, 10);
+            if (*final) /* No digits found, or something like 10ab */
+                return AVERROR(EINVAL);
         }
         c->fd = fd;
     }
@@ -501,11 +501,6 @@ static int fd_open(URLContext *h, const char *filename, int flags)
     c->fd = fd_dup(h, c->fd);
     if (c->fd == -1)
         return AVERROR(errno);
-
-    if (h->is_streamed)
-        c->initial_pos = -1;
-    else
-        c->initial_pos = lseek(c->fd, 0, SEEK_CUR);
 
     return 0;
 }
@@ -628,6 +623,11 @@ static int android_content_open(URLContext *h, const char *filename, int flags)
     ret = ff_jni_exception_check(env, 1, c);
     if (ret < 0)
         goto done;
+    if (!parcel_file_descriptor) {
+        av_log(c, AV_LOG_ERROR, "file descriptor is null\n");
+        ret = AVERROR_EXTERNAL;
+        goto done;
+    }
 
     fd = (*env)->CallIntMethod(env, parcel_file_descriptor, jfields.detach_fd_id);
     ret = ff_jni_exception_check(env, 1, c);
